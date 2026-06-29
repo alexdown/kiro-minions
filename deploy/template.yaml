@@ -2,16 +2,13 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   kiro-minions orchestrator — Jira webhook -> API Gateway -> Lambda ->
-  AgentCore coding agent, with DynamoDB-backed idempotency on sonar_hash.
+  AgentCore managed harness (invoke_harness), with DynamoDB-backed idempotency
+  on sonar_hash.
 
 Parameters:
-  AgentCoreAgentId:
+  AgentCoreHarnessArn:
     Type: String
-    Description: AgentCore (Bedrock) agent id to invoke.
-  AgentCoreAgentAliasId:
-    Type: String
-    Default: TSTALIASID
-    Description: AgentCore agent alias id.
+    Description: ARN of the AgentCore managed harness to invoke (invoke_harness).
   JiraBaseUrl:
     Type: String
     Default: https://chaiawsacct.atlassian.net
@@ -44,8 +41,7 @@ Resources:
       Handler: handler.handler
       Environment:
         Variables:
-          AGENTCORE_AGENT_ID: !Ref AgentCoreAgentId
-          AGENTCORE_AGENT_ALIAS_ID: !Ref AgentCoreAgentAliasId
+          AGENTCORE_HARNESS_ARN: !Ref AgentCoreHarnessArn
           JIRA_BASE_URL: !Ref JiraBaseUrl
           DYNAMODB_TABLE: !Ref JobsTable
       Policies:
@@ -53,7 +49,7 @@ Resources:
             - Sid: InvokeAgentCore
               Effect: Allow
               Action:
-                - bedrock:InvokeAgent
+                - bedrock-agentcore:InvokeHarness
               Resource: '*'
         - DynamoDBCrudPolicy:
             TableName: !Ref JobsTable

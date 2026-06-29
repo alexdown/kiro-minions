@@ -1,0 +1,23 @@
+{
+  "name": "kiro-minions-agent",
+  "description": "Autonomous SonarQube remediation agent. Receives a task prompt describing a SonarQube finding, clones the target repo, applies a fix with kiro-cli, runs the tests, and opens a GitHub PR. The agent drives the loop itself via the built-in shell tool.",
+  "modelProvider": "bedrock",
+  "modelId": "anthropic.claude-sonnet-4-20250514-v1:0",
+  "systemPromptFile": "system-prompt.md",
+  "allowedTools": ["shell", "file_*"],
+  "builtInTools": ["shell", "file_operations"],
+  "environment": {
+    "GITHUB_TOKEN": {
+      "source": "identity-token-vault",
+      "ref": "kiro-minions/github-token"
+    },
+    "KIRO_API_KEY": {
+      "source": "identity-token-vault",
+      "ref": "kiro-minions/kiro-api-key"
+    }
+  },
+  "session": {
+    "isolation": "microvm",
+    "longLived": true
+  }
+}

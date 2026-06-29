@@ -6,7 +6,8 @@ Flow:
     -> parse description Part 1 header + sonar_hash label
     -> idempotency check / claim via DynamoDB (key = sonar_hash)
     -> build TicketPayload
-    -> invoke AgentCore (bedrock-agent-runtime invoke_agent)
+    -> render task prompt from payload
+    -> invoke AgentCore harness (bedrock-agentcore invoke_harness)
     -> 200 / 400 / 500
 """
 
@@ -26,8 +27,7 @@ from parser import (
     parse_description_header,
 )
 
-AGENTCORE_AGENT_ID = os.environ.get("AGENTCORE_AGENT_ID", "")
-AGENTCORE_AGENT_ALIAS_ID = os.environ.get("AGENTCORE_AGENT_ALIAS_ID", "TSTALIASID")
+AGENTCORE_HARNESS_ARN = os.environ.get("AGENTCORE_HARNESS_ARN", "")
 JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "kiro-minions-jobs")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
@@ -41,7 +41,7 @@ STATUS_FAILED = "failed"
 _BLOCKING_STATUSES = {STATUS_IN_FLIGHT, STATUS_DONE}
 
 _dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
-_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
+_agentcore = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
 
 
 def _response(status_code: int, body: dict) -> dict:
@@ -160,27 +160,80 @@ def _build_payload(ticket_id: str, summary: str, description: str,
     }
 
 
-def _invoke_agent(payload: dict) -> str:
-    """Invoke the AgentCore coding agent with the TicketPayload as input.
+def _render_task_prompt(payload: dict) -> str:
+    """Render the TicketPayload into the harness task prompt.
 
-    Returns the aggregated completion text from the streamed response.
+    The harness runs a model in a ReAct loop, so it needs a natural-language
+    brief, not a JSON argument. The full description is embedded verbatim so the
+    agent has the complete SonarQube report (impact, rule, recommended fix).
+    See specs/payload.md -> "Task prompt construction".
     """
-    if not AGENTCORE_AGENT_ID:
-        raise RuntimeError("AGENTCORE_AGENT_ID env var is not set")
-
-    session_id = f"kiro-minions-{payload['sonar_hash']}-{uuid.uuid4().hex[:8]}"
-    resp = _agent_runtime.invoke_agent(
-        agentId=AGENTCORE_AGENT_ID,
-        agentAliasId=AGENTCORE_AGENT_ALIAS_ID,
-        sessionId=session_id,
-        inputText=json.dumps(payload),
+    return (
+        "You are an autonomous software engineer. Fix the SonarQube security "
+        "issue described below.\n\n"
+        "## Task\n"
+        f"- Clone: {payload['repo_clone_url']} "
+        "(use GITHUB_TOKEN env var for auth: "
+        "https://x-token:$GITHUB_TOKEN@github.com/...)\n"
+        f"- Base branch: {payload['base_branch']}\n"
+        f"- Create fix branch: {payload['fix_branch']}\n"
+        f"- Target file: {payload['file_to_fix']}\n\n"
+        "## SonarQube Issue\n"
+        f"{payload['description']}\n\n"
+        "## Instructions\n"
+        "1. Clone the repo and check out the base branch\n"
+        "2. Create the fix branch\n"
+        "3. Run kiro-cli to apply the fix: pipe the issue description to "
+        "kiro-cli chat --no-interactive --trust-all-tools\n"
+        "4. Run the test suite (auto-detect: npm test / mvn test / pytest / "
+        "make test)\n"
+        "5. If tests fail, review the failure and iterate with kiro-cli until "
+        "they pass\n"
+        f"6. Commit all changes with message: \"fix: {payload['summary']} "
+        f"[{payload['ticket_id']}]\"\n"
+        "7. Push the branch\n"
+        f"8. Open a PR against {payload['base_branch']} using the GitHub CLI or "
+        f"API. Include: ticket URL {payload['ticket_url']}, sonar_hash "
+        f"{payload['sonar_hash']}\n\n"
+        "You have shell access. Use it. Work until the PR is open."
     )
 
+
+def _invoke_agent(payload: dict) -> str:
+    """Invoke the AgentCore managed harness with a rendered task prompt.
+
+    Calls ``invoke_harness`` (not ``invoke_agent``): the harness is a stateful
+    model-in-a-loop runtime that drives git/kiro/tests/PR itself via its
+    built-in ``shell`` tool. Returns the aggregated streamed text for logging.
+    """
+    if not AGENTCORE_HARNESS_ARN:
+        raise RuntimeError("AGENTCORE_HARNESS_ARN env var is not set")
+
+    # runtimeSessionId must be >= 33 chars. Derive from sonar_hash + uuid for
+    # traceability while guaranteeing the length/uniqueness requirements.
+    session_id = f"kiro-minions-{payload['sonar_hash']}-{uuid.uuid4().hex}"
+
+    task_prompt = _render_task_prompt(payload)
+
+    resp = _agentcore.invoke_harness(
+        harnessArn=AGENTCORE_HARNESS_ARN,
+        runtimeSessionId=session_id,
+        messages=[
+            {
+                "role": "user",
+                "content": [{"text": task_prompt}],
+            }
+        ],
+    )
+
+    # invoke_harness returns a streaming response; aggregate text for logging.
     chunks: list[str] = []
-    for event in resp.get("completion", []):
-        chunk = event.get("chunk")
+    for event in resp.get("completion", resp.get("stream", [])):
+        chunk = event.get("chunk") if isinstance(event, dict) else None
         if chunk and "bytes" in chunk:
             chunks.append(chunk["bytes"].decode("utf-8", errors="replace"))
+        elif isinstance(event, dict) and "text" in event:
+            chunks.append(event["text"])
     return "".join(chunks)
 
 
