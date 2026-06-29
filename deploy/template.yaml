@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  kiro-minions orchestrator — Jira webhook -> API Gateway -> Lambda ->
+  AgentCore coding agent, with DynamoDB-backed idempotency on sonar_hash.
+
+Parameters:
+  AgentCoreAgentId:
+    Type: String
+    Description: AgentCore (Bedrock) agent id to invoke.
+  AgentCoreAgentAliasId:
+    Type: String
+    Default: TSTALIASID
+    Description: AgentCore agent alias id.
+  JiraBaseUrl:
+    Type: String
+    Default: https://chaiawsacct.atlassian.net
+    Description: Jira base URL, used to build ticket backlinks.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 512
+    Timeout: 60
+
+Resources:
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: kiro-minions-jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sonar_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sonar_hash
+          KeyType: HASH
+
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: kiro-minions-orchestrator
+      CodeUri: ../orchestrator/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          AGENTCORE_AGENT_ID: !Ref AgentCoreAgentId
+          AGENTCORE_AGENT_ALIAS_ID: !Ref AgentCoreAgentAliasId
+          JIRA_BASE_URL: !Ref JiraBaseUrl
+          DYNAMODB_TABLE: !Ref JobsTable
+      Policies:
+        - Statement:
+            - Sid: InvokeAgentCore
+              Effect: Allow
+              Action:
+                - bedrock:InvokeAgent
+              Resource: '*'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Path: /webhook
+            Method: POST
+
+  WebhookApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+
+Outputs:
+  WebhookUrl:
+    Description: API Gateway endpoint to configure as the Jira webhook target.
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
+  JobsTableName:
+    Description: DynamoDB idempotency table name.
+    Value: !Ref JobsTable
