@@ -1,26 +1,28 @@
 # kiro-minions 🤖
 
-Skeletal demo: Jira ticket in → autonomous code fix → GitHub PR out.
+Skeletal demo of autonomous software engineering: a labelled Jira ticket goes in, a GitHub PR comes out.
 
 ```
-Orchestrator (Python script)
-  → polls Jira for SONARQUBE_FIX tickets
-  → invokes one AgentCore agent per ticket (passes full context)
-
-Coding Agent (AgentCore + kiro-cli headless)
-  → receives ticket context
-  → git clone → branch → kiro fix → test → PR
+Jira ticket (label=SONARQUBE_FIX)
+  → webhook → API Gateway → Orchestrator (Lambda, Python)
+      → read ticket via Jira REST, transition to "In Progress"
+      → invoke_agent(payload)
+  → Coding Agent (AgentCore managed harness)
+      → git clone → kiro-cli headless → run tests → open PR
+  → GitHub PR
 ```
 
-## Structure
+The orchestrator owns Jira. The agent owns GitHub + kiro. Neither reaches into the other's domain — the only thing crossing the boundary is a JSON `TicketPayload`.
+
+## Layout
 
 ```
-orchestrator/   - Jira poller + AgentCore invoker
-agent/          - Coding agent container (kiro-cli inside)
-specs/          - Design docs
+orchestrator/   Lambda: Jira webhook handler + AgentCore invoker
+agent/          AgentCore managed-harness coding agent (runs kiro-cli)
+specs/          Design docs
 ```
 
 ## Docs
 
-- [specs/overview.md](specs/overview.md)
-- [specs/payload.md](specs/payload.md)
+- [specs/overview.md](specs/overview.md) — architecture, components, data flow
+- [specs/payload.md](specs/payload.md) — payload schema + ticket parsing convention

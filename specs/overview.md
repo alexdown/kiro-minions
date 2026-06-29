@@ -1,51 +1,71 @@
 # Overview
 
-## What it does
+Autonomous SonarQube remediation: a labelled Jira ticket goes in, a GitHub PR comes out. No human in the loop between the two.
 
-1. **Jira webhook** triggers a Lambda when a ticket with label `SONARQUBE_FIX` is created or updated
-2. Lambda packages the ticket content into a JSON payload and invokes an AgentCore coding agent (managed harness)
-3. **Coding agent** receives the payload, clones the repo, runs kiro-cli headless, tests, opens a PR
+## Flow
+
+1. An engineer (or SonarQube automation) creates/updates a Jira ticket labelled `SONARQUBE_FIX`.
+2. Jira fires a webhook → API Gateway → **orchestrator** Lambda.
+3. The orchestrator reads the ticket via the Jira REST API, builds a `TicketPayload`, transitions the ticket to **In Progress**, and invokes the **coding agent**.
+4. The coding agent receives the payload (and nothing else — it never touches Jira), clones the repo, runs `kiro-cli` headless to produce the fix, runs the tests, and opens a GitHub PR.
 
 ## Architecture
 
 ```
-Jira (SONARQUBE_FIX ticket created/updated)
-  → webhook → API Gateway → Lambda (orchestrator)
-    → package payload
-    → invoke AgentCore managed harness agent
-      → git clone → branch → kiro headless → test → PR
+                            webhook (ticket created/updated, label=SONARQUBE_FIX)
+  Jira  ──────────────────────────────────────────────►  API Gateway
+   ▲                                                          │
+   │ REST: read fields, transition to "In Progress"          ▼
+   │                                                  ┌───────────────┐
+   └──────────────────────────────────────────────── │  Orchestrator │  (Lambda, Python)
+                                                       └───────┬───────┘
+                                                               │ invoke_agent(payload)
+                                                               ▼
+                                                       ┌───────────────┐
+                                                       │  Coding Agent │  (AgentCore managed harness)
+                                                       └───────┬───────┘
+                                                               │
+                  git clone ──► kiro-cli headless ──► run tests ──► open PR
+                                                               │
+                                                               ▼
+                                                            GitHub PR
 ```
 
 ## Components
 
 ### Orchestrator (`orchestrator/`)
-- AWS Lambda triggered by Jira webhook (via API Gateway)
-- Uses official Atlassian MCP to read ticket details
-- Builds `TicketPayload` and invokes the AgentCore agent
-- Transitions Jira ticket to "In Progress" to avoid re-processing
+Python Lambda behind API Gateway, triggered by the Jira webhook.
+
+- Validates the webhook payload; ignores tickets without the `SONARQUBE_FIX` label.
+- Calls the **Jira REST API** directly (`JIRA_BASE_URL` + `JIRA_TOKEN`). No MCP — it's too heavy for a Lambda and buys nothing here.
+- Parses `REPO:` / `BRANCH:` from the ticket description (see [payload.md](payload.md)).
+- Transitions the ticket to **In Progress** *before* dispatch. This is the idempotency guard: re-fired webhooks for an in-progress ticket are dropped.
+- Invokes the coding agent via boto3 `bedrock-agent-runtime` → `invoke_agent`, passing the `TicketPayload` as input.
 
 ### Coding Agent (`agent/`)
-- AgentCore **managed harness** (no custom container to maintain)
-- Receives `TicketPayload` as input — never calls Jira
-- Flow: `git clone` → `git checkout -b fix/TICKET-ID` → `kiro --headless <task>` → run tests → open PR
-- Returns `{ status, pr_url, error }`
+An **AgentCore managed harness** — no custom container to build or maintain. AgentCore hands it the JSON payload as input.
 
-## Jira ticket format (expected)
-```
-Summary: <short description>
-Description:
-  REPO: https://github.com/org/repo
-  BRANCH: main
-  ---
-  <what needs to be fixed and why>
-```
-The `REPO:` and `BRANCH:` lines are parsed by the orchestrator to populate the payload.
+Flow:
+1. `git clone` the repo using `GITHUB_TOKEN`, check out `default_branch`, create `fix/<ticket_id>`.
+2. Run kiro headless with the ticket summary + description as the task prompt:
+   ```bash
+   kiro-cli chat --no-interactive --trust-all-tools "<prompt>"
+   ```
+   `KIRO_API_KEY` is the only auth. A repo may ship a custom persona at `.kiro/agents/<name>.json`; if present, kiro-cli picks it up automatically. Large prompts can be piped via stdin:
+   ```bash
+   cat task.txt | kiro-cli chat --no-interactive --trust-all-tools "Fix per the attached task"
+   ```
+3. Run the repo's test suite. On failure, the agent iterates or bails (returns `error`).
+4. Push the branch and open a PR with `GITHUB_TOKEN`.
 
-## Credentials
-- `GITHUB_TOKEN` — clone + PR (coding agent)
-- `JIRA_TOKEN` — Atlassian MCP auth (orchestrator)
-- `KIRO_TOKEN` — kiro-cli auth (coding agent, if required)
+Returns `{ status, pr_url, error }`. The agent has **no Jira credentials** — closing the loop back to Jira (if wanted) is the orchestrator's job, not the agent's.
 
-## Open questions
-1. **kiro headless syntax** — docs at kiro.dev/docs/cli/headless/ are JS-rendered, couldn't scrape. Need: exact command, how task/prompt is passed (flag? stdin? file?). TODO: check manually.
-2. **AgentCore managed harness** — confirm invocation API: is it `bedrock-agent-runtime` `invoke_agent`, or a different endpoint for the managed harness?
+## Credentials (env vars)
+
+| Var | Used by | Purpose |
+|---|---|---|
+| `JIRA_BASE_URL`, `JIRA_TOKEN` | orchestrator | read ticket, transition status |
+| `GITHUB_TOKEN` | agent | clone repo, open PR |
+| `KIRO_API_KEY` | agent | kiro-cli headless auth |
+
+The agent's blast radius is deliberately limited to GitHub + kiro. It cannot read or mutate Jira.
