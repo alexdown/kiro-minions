@@ -5,8 +5,8 @@ Autonomous SonarQube remediation: a labelled Jira ticket goes in, a GitHub PR co
 ## Flow
 
 1. An engineer (or SonarQube automation) creates/updates a Jira ticket labelled `SONARQUBE_FIX`.
-2. Jira fires a webhook → API Gateway → **orchestrator** Lambda.
-3. The orchestrator reads the ticket via the Jira REST API, builds a `TicketPayload`, transitions the ticket to **In Progress**, and invokes the **coding agent**.
+2. Jira fires a webhook → API Gateway → **orchestrator** Lambda. The webhook body contains the full ticket content.
+3. The orchestrator parses the webhook payload directly (no Jira API call needed), builds a `TicketPayload`, and invokes the **coding agent**.
 4. The coding agent receives the payload (and nothing else — it never touches Jira), clones the repo, runs `kiro-cli` headless to produce the fix, runs the tests, and opens a GitHub PR.
 
 ## Architecture
@@ -14,10 +14,10 @@ Autonomous SonarQube remediation: a labelled Jira ticket goes in, a GitHub PR co
 ```
                             webhook (ticket created/updated, label=SONARQUBE_FIX)
   Jira  ──────────────────────────────────────────────►  API Gateway
-   ▲                                                          │
-   │ REST: read fields, transition to "In Progress"          ▼
-   │                                                  ┌───────────────┐
-   └──────────────────────────────────────────────── │  Orchestrator │  (Lambda, Python)
+                                                               │
+                                                               ▼
+                                                       ┌───────────────┐
+                                                       │  Orchestrator │  (Lambda, Python)
                                                        └───────┬───────┘
                                                                │ invoke_agent(payload)
                                                                ▼
@@ -36,10 +36,9 @@ Autonomous SonarQube remediation: a labelled Jira ticket goes in, a GitHub PR co
 ### Orchestrator (`orchestrator/`)
 Python Lambda behind API Gateway, triggered by the Jira webhook.
 
-- Validates the webhook payload; ignores tickets without the `SONARQUBE_FIX` label.
-- Calls the **Jira REST API** directly (`JIRA_BASE_URL` + `JIRA_TOKEN`). No MCP — it's too heavy for a Lambda and buys nothing here.
+- Validates the incoming webhook body; ignores events without the `SONARQUBE_FIX` label.
+- Parses the webhook payload directly — ticket ID, summary, description, and metadata are all in the webhook body. No Jira API call needed.
 - Parses `REPO:` / `BRANCH:` from the ticket description (see [payload.md](payload.md)).
-- Transitions the ticket to **In Progress** *before* dispatch. This is the idempotency guard: re-fired webhooks for an in-progress ticket are dropped.
 - Invokes the coding agent via boto3 `bedrock-agent-runtime` → `invoke_agent`, passing the `TicketPayload` as input.
 
 ### Coding Agent (`agent/`)
@@ -64,8 +63,7 @@ Returns `{ status, pr_url, error }`. The agent has **no Jira credentials** — c
 
 | Var | Used by | Purpose |
 |---|---|---|
-| `JIRA_BASE_URL`, `JIRA_TOKEN` | orchestrator | read ticket, transition status |
 | `GITHUB_TOKEN` | agent | clone repo, open PR |
 | `KIRO_API_KEY` | agent | kiro-cli headless auth |
 
-The agent's blast radius is deliberately limited to GitHub + kiro. It cannot read or mutate Jira.
+The orchestrator needs no external credentials beyond AWS IAM (to invoke AgentCore). The agent's blast radius is limited to GitHub + kiro only.
