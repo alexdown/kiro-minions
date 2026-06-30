@@ -33,8 +33,8 @@ The Jira description is authored as a self-contained task brief in **two parts**
 
 ```
 ── Part 1: structured header block (machine-readable) ──
-Repo URL: https://github.com/alexdown/NodeGoat
-Clone:    https://github.com/alexdown/NodeGoat.git
+Repo URL: https://github.com/your-org/your-repo
+Clone:    https://github.com/your-org/your-repo.git
 Base branch: master
 File to fix: server.js:135
 Suggested fix branch: sonarqube-fix/xss-swig-autoescape
@@ -42,7 +42,7 @@ Suggested fix branch: sonarqube-fix/xss-swig-autoescape
 ── Part 2: inline SonarQube issue report (human + agent readable) ──
 SONAR-MCP-001: XSS — Template Auto-Escaping Disabled
 Priority: P0 (Critical) · Type: Security Vulnerability · CWE-79 · OWASP A03:2021
-File: NodeGoat/server.js · Line: 135 · Rule: javascript:S5247
+File: your-repo/server.js · Line: 135 · Rule: javascript:S5247
 Hotspot Key: 6f50f92a-65f2-4c4c-aae5-9b069b44430a
 
 Description / Impact / Recommended Fix:

@@ -1,6 +1,6 @@
 """Unit tests for the orchestrator description parser.
 
-Exercises the real SW-15 ticket content from the specs, plus edge cases.
+Exercises the real PROJ-15 ticket content from the specs, plus edge cases.
 """
 
 import os
@@ -21,17 +21,17 @@ from parser import (  # noqa: E402
 )
 
 
-# The exact SW-15 description (Part 1 header + Part 2 inline SonarQube report).
+# The exact PROJ-15 description (Part 1 header + Part 2 inline SonarQube report).
 SW15_DESCRIPTION = """\
-Repo URL: https://github.com/alexdown/NodeGoat
-Clone: https://github.com/alexdown/NodeGoat.git
+Repo URL: https://github.com/your-org/your-repo
+Clone: https://github.com/your-org/your-repo.git
 Base branch: master
 File to fix: server.js:135
 Suggested fix branch: sonarqube-fix/xss-swig-autoescape
 
 SONAR-MCP-001: XSS — Template Auto-Escaping Disabled
 Priority: P0 (Critical) · Type: Security Vulnerability · CWE-79 · OWASP A03:2021
-File: NodeGoat/server.js · Line: 135 · Rule: javascript:S5247
+File: your-repo/server.js · Line: 135 · Rule: javascript:S5247
 Hotspot Key: 6f50f92a-65f2-4c4c-aae5-9b069b44430a
 
 Description / Impact / Recommended Fix:
@@ -40,7 +40,7 @@ Description / Impact / Recommended Fix:
 References · _sonar-hash: 6f50f92a-65f2-4c4c-aae5-9b069b44430a (dedup marker)
 """
 
-# The real labels array from SW-15.
+# The real labels array from PROJ-15.
 SW15_LABELS = [
     "CWE-79",
     "OWASP-A03",
@@ -55,7 +55,7 @@ SW15_LABELS = [
 
 def test_parse_sw15_header():
     header = parse_description_header(SW15_DESCRIPTION)
-    assert header["repo_clone_url"] == "https://github.com/alexdown/NodeGoat.git"
+    assert header["repo_clone_url"] == "https://github.com/your-org/your-repo.git"
     assert header["base_branch"] == "master"
     assert header["file_to_fix"] == "server.js:135"
     assert header["fix_branch"] == "sonarqube-fix/xss-swig-autoescape"

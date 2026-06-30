@@ -11,7 +11,7 @@ Parameters:
     Description: ARN of the AgentCore managed harness to invoke (invoke_harness).
   JiraBaseUrl:
     Type: String
-    Default: https://chaiawsacct.atlassian.net
+    Default: https://your-org.atlassian.net
     Description: Jira base URL, used to build ticket backlinks.
 
 Globals:

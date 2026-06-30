@@ -24,8 +24,8 @@ def parse_description_header(description: str) -> dict:
 
     The header is line-prefix based, e.g.::
 
-        Repo URL: https://github.com/alexdown/NodeGoat
-        Clone: https://github.com/alexdown/NodeGoat.git
+        Repo URL: https://github.com/your-org/your-repo
+        Clone: https://github.com/your-org/your-repo.git
         Base branch: master
         File to fix: server.js:135
         Suggested fix branch: sonarqube-fix/xss-swig-autoescape

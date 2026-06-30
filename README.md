@@ -18,13 +18,13 @@ The coding agent is **not Python code** — it is an AgentCore *managed harness*
 
 The ticket description **is** the brief. It's two parts: a machine-readable header block (repo, branch, fix branch, file) followed by the full SonarQube issue report (description, impact, recommended fix). The orchestrator reads the header to drive mechanics; the agent gets the whole description verbatim as its kiro prompt.
 
-## Example ticket (SW-15)
+## Example ticket (PROJ-15)
 
 ```
 Title: [SonarQube][P0] XSS — Swig template auto-escaping disabled (server.js:135)
 
-Repo URL: https://github.com/alexdown/NodeGoat
-Clone: https://github.com/alexdown/NodeGoat.git
+Repo URL: https://github.com/your-org/your-repo
+Clone: https://github.com/your-org/your-repo.git
 Base branch: master
 File to fix: server.js:135
 Suggested fix branch: sonarqube-fix/xss-swig-autoescape

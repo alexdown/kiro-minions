@@ -4,11 +4,11 @@ The contract the orchestrator builds from the Jira webhook body. It is the orche
 
 ```json
 {
-  "ticket_id": "SW-15",
+  "ticket_id": "PROJ-15",
   "summary": "[SonarQube][P0] XSS — Swig template auto-escaping disabled (server.js:135)",
   "description": "<full verbatim Jira description — structured header block + inline SonarQube report>",
-  "ticket_url": "https://chaiawsacct.atlassian.net/browse/SW-15",
-  "repo_clone_url": "https://github.com/alexdown/NodeGoat.git",
+  "ticket_url": "https://your-org.atlassian.net/browse/PROJ-15",
+  "repo_clone_url": "https://github.com/your-org/your-repo.git",
   "base_branch": "master",
   "fix_branch": "sonarqube-fix/xss-swig-autoescape",
   "file_to_fix": "server.js:135",
@@ -20,7 +20,7 @@ The contract the orchestrator builds from the Jira webhook body. It is the orche
 
 | Field | Source | Notes |
 |---|---|---|
-| `ticket_id` | `issue.key` | e.g. `SW-15`; used in PR title/body backlink |
+| `ticket_id` | `issue.key` | e.g. `PROJ-15`; used in PR title/body backlink |
 | `summary` | `issue.fields.summary` | the one-line title; not used to drive mechanics |
 | `description` | `issue.fields.description` | **full, verbatim** — both parts. Becomes the kiro prompt context |
 | `ticket_url` | `{JIRA_BASE_URL}/browse/{ticket_id}` | for PR body backlink |
@@ -39,8 +39,8 @@ Two sources in the webhook body: the **structured header** inside `description`,
 The top of the Jira description is machine-readable, line-prefix based:
 
 ```
-Repo URL: https://github.com/alexdown/NodeGoat
-Clone: https://github.com/alexdown/NodeGoat.git
+Repo URL: https://github.com/your-org/your-repo
+Clone: https://github.com/your-org/your-repo.git
 Base branch: master
 File to fix: server.js:135
 Suggested fix branch: sonarqube-fix/xss-swig-autoescape
