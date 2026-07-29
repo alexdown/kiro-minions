@@ -1,0 +1,32 @@
+# AgentCore Runtime deployment configuration for kiro-minions.
+#
+# Deploy with:  agentcore launch  (from the runtime/ directory)
+#
+# This builds the ARM64 container via CodeBuild, pushes to ECR, and deploys
+# an AgentCore Runtime. The orchestrator then invokes this Runtime directly
+# (no managed harness — the workflow logic is in agent.py).
+
+default_agent: kiro-minions
+
+agents:
+  kiro-minions:
+    name: kiro-minions
+    language: python
+    entrypoint: agent.py
+    deployment_type: container
+    platform: linux/arm64
+    container_runtime: none
+    aws:
+      execution_role_auto_create: true
+      account: "${AWS_ACCOUNT_ID}"
+      region: us-east-1
+      ecr_auto_create: true
+      network_configuration:
+        # PUBLIC: outbound internet access needed for git clone, gh CLI, kiro-cli API
+        network_mode: PUBLIC
+      protocol_configuration:
+        server_protocol: HTTP
+      observability:
+        enabled: true
+    memory:
+      mode: NO_MEMORY
