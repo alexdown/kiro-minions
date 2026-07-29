@@ -6,8 +6,7 @@ Flow:
     -> parse description Part 1 header + sonar_hash label
     -> idempotency check / claim via DynamoDB (key = sonar_hash)
     -> build TicketPayload
-    -> render task prompt from payload
-    -> invoke AgentCore harness (bedrock-agentcore invoke_harness)
+    -> invoke AgentCore Runtime with payload (JSON, not a rendered prompt)
     -> 200 / 400 / 500
 """
 
@@ -27,7 +26,7 @@ from parser import (
     parse_description_header,
 )
 
-AGENTCORE_HARNESS_ARN = os.environ.get("AGENTCORE_HARNESS_ARN", "")
+AGENTCORE_RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "kiro-minions-jobs")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
@@ -143,7 +142,11 @@ def _mark_status(sonar_hash: str, status: str, extra: dict | None = None) -> Non
 
 def _build_payload(ticket_id: str, summary: str, description: str,
                    header: dict, sonar_hash: str) -> dict:
-    """Assemble the TicketPayload contract object."""
+    """Assemble the TicketPayload contract object.
+
+    This payload is sent as-is (JSON) to the AgentCore Runtime. The runtime's
+    agent.py receives it directly — no prompt rendering needed.
+    """
     ticket_url = (
         f"{JIRA_BASE_URL}/browse/{ticket_id}" if JIRA_BASE_URL and ticket_id else ""
     )
@@ -160,80 +163,48 @@ def _build_payload(ticket_id: str, summary: str, description: str,
     }
 
 
-def _render_task_prompt(payload: dict) -> str:
-    """Render the TicketPayload into the harness task prompt.
+def _invoke_runtime(payload: dict) -> str:
+    """Invoke the AgentCore Runtime with the TicketPayload.
 
-    The harness runs a model in a ReAct loop, so it needs a natural-language
-    brief, not a JSON argument. The full description is embedded verbatim so the
-    agent has the complete SonarQube report (impact, rule, recommended fix).
-    See specs/payload.md -> "Task prompt construction".
+    The Runtime container receives the payload as JSON and runs the
+    deterministic fix pipeline (clone → kiro-cli → test → PR). No model
+    reasoning happens here — the only intelligence is inside kiro-cli.
+
+    Returns the aggregated response text for logging.
     """
-    return (
-        "You are an autonomous software engineer. Fix the SonarQube security "
-        "issue described below.\n\n"
-        "## Task\n"
-        f"- Clone: {payload['repo_clone_url']} "
-        "(use GITHUB_TOKEN env var for auth: "
-        "https://x-token:$GITHUB_TOKEN@github.com/...)\n"
-        f"- Base branch: {payload['base_branch']}\n"
-        f"- Create fix branch: {payload['fix_branch']}\n"
-        f"- Target file: {payload['file_to_fix']}\n\n"
-        "## SonarQube Issue\n"
-        f"{payload['description']}\n\n"
-        "## Instructions\n"
-        "1. Clone the repo and check out the base branch\n"
-        "2. Create the fix branch\n"
-        "3. Run kiro-cli to apply the fix: pipe the issue description to "
-        "kiro-cli chat --no-interactive --trust-all-tools\n"
-        "4. Run the test suite (auto-detect: npm test / mvn test / pytest / "
-        "make test)\n"
-        "5. If tests fail, review the failure and iterate with kiro-cli until "
-        "they pass\n"
-        f"6. Commit all changes with message: \"fix: {payload['summary']} "
-        f"[{payload['ticket_id']}]\"\n"
-        "7. Push the branch\n"
-        f"8. Open a PR against {payload['base_branch']} using the GitHub CLI or "
-        f"API. Include: ticket URL {payload['ticket_url']}, sonar_hash "
-        f"{payload['sonar_hash']}\n\n"
-        "You have shell access. Use it. Work until the PR is open."
-    )
+    if not AGENTCORE_RUNTIME_ARN:
+        raise RuntimeError("AGENTCORE_RUNTIME_ARN env var is not set")
 
-
-def _invoke_agent(payload: dict) -> str:
-    """Invoke the AgentCore managed harness with a rendered task prompt.
-
-    Calls ``invoke_harness`` (not ``invoke_agent``): the harness is a stateful
-    model-in-a-loop runtime that drives git/kiro/tests/PR itself via its
-    built-in ``shell`` tool. Returns the aggregated streamed text for logging.
-    """
-    if not AGENTCORE_HARNESS_ARN:
-        raise RuntimeError("AGENTCORE_HARNESS_ARN env var is not set")
-
-    # runtimeSessionId must be >= 33 chars. Derive from sonar_hash + uuid for
-    # traceability while guaranteeing the length/uniqueness requirements.
+    # runtimeSessionId must be >= 33 chars.
     session_id = f"kiro-minions-{payload['sonar_hash']}-{uuid.uuid4().hex}"
 
-    task_prompt = _render_task_prompt(payload)
-
-    resp = _agentcore.invoke_harness(
-        harnessArn=AGENTCORE_HARNESS_ARN,
+    resp = _agentcore.invoke(
+        runtimeArn=AGENTCORE_RUNTIME_ARN,
         runtimeSessionId=session_id,
-        messages=[
-            {
-                "role": "user",
-                "content": [{"text": task_prompt}],
-            }
-        ],
+        payload=json.dumps(payload).encode("utf-8"),
     )
 
-    # invoke_harness returns a streaming response; aggregate text for logging.
+    # The response may be streaming or a direct body.
+    # Handle both: streaming chunks or a single response body.
     chunks: list[str] = []
-    for event in resp.get("completion", resp.get("stream", [])):
-        chunk = event.get("chunk") if isinstance(event, dict) else None
-        if chunk and "bytes" in chunk:
-            chunks.append(chunk["bytes"].decode("utf-8", errors="replace"))
-        elif isinstance(event, dict) and "text" in event:
-            chunks.append(event["text"])
+
+    if "body" in resp:
+        body = resp["body"]
+        if hasattr(body, "read"):
+            chunks.append(body.read().decode("utf-8", errors="replace"))
+        elif isinstance(body, (bytes, bytearray)):
+            chunks.append(body.decode("utf-8", errors="replace"))
+        elif isinstance(body, str):
+            chunks.append(body)
+
+    if "stream" in resp:
+        for event in resp["stream"]:
+            chunk = event.get("chunk") if isinstance(event, dict) else None
+            if chunk and "bytes" in chunk:
+                chunks.append(chunk["bytes"].decode("utf-8", errors="replace"))
+            elif isinstance(event, dict) and "text" in event:
+                chunks.append(event["text"])
+
     return "".join(chunks)
 
 
@@ -286,14 +257,14 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
             },
         )
 
-    # --- Build payload and dispatch to the coding agent ---
+    # --- Build payload and dispatch to the Runtime ---
     payload = _build_payload(ticket_id, summary, description, header, sonar_hash)
 
     try:
-        completion = _invoke_agent(payload)
+        result = _invoke_runtime(payload)
     except Exception as exc:  # noqa: BLE001 - report any dispatch failure
         _mark_status(sonar_hash, STATUS_FAILED, {"error": str(exc)})
-        return _response(500, {"error": f"agent invocation failed: {exc}"})
+        return _response(500, {"error": f"runtime invocation failed: {exc}"})
 
     return _response(
         200,
@@ -301,6 +272,6 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
             "status": "dispatched",
             "sonar_hash": sonar_hash,
             "ticket_id": ticket_id,
-            "agent_response": completion,
+            "runtime_response": result,
         },
     )

@@ -1,0 +1,330 @@
+"""B1 deterministic workflow agent for kiro-minions.
+
+This is NOT a model-in-a-loop. It is a scripted pipeline that receives a
+TicketPayload from the orchestrator and executes a fixed sequence:
+
+    clone → branch → kiro-cli fix → test → retry loop → commit → push → PR
+
+The only "intelligence" is inside kiro-cli itself. Everything else is
+deterministic shell commands with structured error handling.
+
+Runs as an AgentCore Runtime container. Exposes /invocations (POST) and
+/ping (GET) per the Runtime contract.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+KIRO_API_KEY = os.environ.get("KIRO_API_KEY", "")  # kiro-cli reads this directly
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("kiro-minions-agent")
+
+app = BedrockAgentCoreApp()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True,
+         timeout: int = 600) -> subprocess.CompletedProcess:
+    """Run a shell command, log it, and return the result."""
+    if isinstance(cmd, str):
+        shell = True
+        display = cmd
+    else:
+        shell = False
+        display = " ".join(cmd)
+
+    log.info("RUN: %s (cwd=%s)", display, cwd or ".")
+    result = subprocess.run(
+        cmd, shell=shell, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+    )
+    if result.stdout:
+        log.info("STDOUT:\n%s", result.stdout[-2000:])
+    if result.stderr:
+        log.info("STDERR:\n%s", result.stderr[-2000:])
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed (rc={result.returncode}): {display}\n"
+            f"stderr: {result.stderr[-500:]}"
+        )
+    return result
+
+
+def _auth_clone_url(clone_url: str) -> str:
+    """Inject GITHUB_TOKEN into the clone URL for authentication."""
+    if not GITHUB_TOKEN:
+        return clone_url
+    # https://github.com/org/repo.git → https://x-token:<token>@github.com/org/repo.git
+    if clone_url.startswith("https://"):
+        return clone_url.replace("https://", f"https://x-token:{GITHUB_TOKEN}@", 1)
+    return clone_url
+
+
+def _detect_test_command(repo_dir: Path) -> str | None:
+    """Auto-detect the test runner for the repo."""
+    if (repo_dir / "package.json").exists():
+        return "npm test"
+    if (repo_dir / "pom.xml").exists():
+        return "mvn test"
+    if (repo_dir / "Makefile").exists():
+        makefile = (repo_dir / "Makefile").read_text(errors="replace")
+        if "test:" in makefile or "test :" in makefile:
+            return "make test"
+    # Python: pytest.ini, pyproject.toml with [tool.pytest], setup.py, or tests/ dir
+    if (repo_dir / "pytest.ini").exists():
+        return "pytest"
+    if (repo_dir / "pyproject.toml").exists():
+        content = (repo_dir / "pyproject.toml").read_text(errors="replace")
+        if "pytest" in content or "tool.pytest" in content:
+            return "pytest"
+    if (repo_dir / "setup.py").exists() and (repo_dir / "tests").is_dir():
+        return "pytest"
+    if (repo_dir / "tests").is_dir():
+        return "pytest"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pipeline steps
+# ---------------------------------------------------------------------------
+
+
+def step_clone(clone_url: str, base_branch: str, workdir: Path) -> Path:
+    """Clone the repo and checkout the base branch."""
+    auth_url = _auth_clone_url(clone_url)
+    repo_name = clone_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    repo_dir = workdir / repo_name
+
+    _run(f"git clone --branch {base_branch} --single-branch {auth_url} {repo_dir}")
+    _run("git config user.email 'kiro-minions[bot]@users.noreply.github.com'", cwd=repo_dir)
+    _run("git config user.name 'kiro-minions[bot]'", cwd=repo_dir)
+    return repo_dir
+
+
+def step_create_branch(repo_dir: Path, fix_branch: str) -> None:
+    """Create and checkout the fix branch."""
+    _run(f"git checkout -b {fix_branch}", cwd=repo_dir)
+
+
+def step_kiro_fix(repo_dir: Path, description: str, file_to_fix: str | None,
+                  attempt: int, last_failure: str | None) -> None:
+    """Run kiro-cli headless to apply the fix."""
+    # Build the brief: on first attempt, just the issue. On retries, add failure context.
+    brief_parts = []
+    if attempt > 1 and last_failure:
+        brief_parts.append(
+            f"PREVIOUS ATTEMPT FAILED. Test output:\n{last_failure}\n\n"
+            "Please fix the issue considering the test failure above.\n\n"
+        )
+    brief_parts.append(description)
+    if file_to_fix:
+        brief_parts.append(f"\n\nFocus on file: {file_to_fix}")
+
+    brief = "".join(brief_parts)
+
+    _run(
+        ["kiro-cli", "chat", "--no-interactive", "--trust-all-tools", brief],
+        cwd=repo_dir,
+        timeout=300,
+    )
+
+
+def step_run_tests(repo_dir: Path) -> tuple[bool, str]:
+    """Detect and run the test suite. Returns (passed, output)."""
+    test_cmd = _detect_test_command(repo_dir)
+    if test_cmd is None:
+        log.info("No test suite detected — skipping tests.")
+        return True, "no tests detected"
+
+    log.info("Detected test command: %s", test_cmd)
+    result = _run(test_cmd, cwd=repo_dir, check=False, timeout=300)
+    output = (result.stdout + "\n" + result.stderr).strip()
+    passed = result.returncode == 0
+    if passed:
+        log.info("Tests PASSED.")
+    else:
+        log.warning("Tests FAILED (rc=%d).", result.returncode)
+    return passed, output
+
+
+def step_commit(repo_dir: Path, summary: str, ticket_id: str, sonar_hash: str) -> bool:
+    """Stage all changes and commit. Returns True if there were changes to commit."""
+    _run("git add -A", cwd=repo_dir)
+
+    # Check if there's anything to commit
+    result = _run("git diff --cached --quiet", cwd=repo_dir, check=False)
+    if result.returncode == 0:
+        log.warning("No changes to commit — kiro-cli produced no diff.")
+        return False
+
+    commit_msg = f"fix: {summary} [{ticket_id}]\n\nsonar_hash: {sonar_hash}"
+    _run(["git", "commit", "-m", commit_msg], cwd=repo_dir)
+    return True
+
+
+def step_push(repo_dir: Path, fix_branch: str) -> None:
+    """Push the fix branch to origin."""
+    _run(f"git push origin {fix_branch}", cwd=repo_dir)
+
+
+def step_open_pr(repo_dir: Path, base_branch: str, fix_branch: str,
+                 summary: str, ticket_id: str, ticket_url: str,
+                 sonar_hash: str) -> str:
+    """Open a GitHub PR and return the PR URL."""
+    pr_title = f"fix: {summary} [{ticket_id}]"
+    pr_body = (
+        f"## Automated SonarQube Fix\n\n"
+        f"**Ticket:** [{ticket_id}]({ticket_url})\n"
+        f"**sonar_hash:** `{sonar_hash}`\n\n"
+        f"This PR was generated automatically by kiro-minions.\n"
+    )
+
+    result = _run(
+        [
+            "gh", "pr", "create",
+            "--base", base_branch,
+            "--head", fix_branch,
+            "--title", pr_title,
+            "--body", pr_body,
+        ],
+        cwd=repo_dir,
+    )
+    pr_url = result.stdout.strip()
+    log.info("PR opened: %s", pr_url)
+    return pr_url
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+
+def run_pipeline(payload: dict) -> dict:
+    """Execute the full fix pipeline. Returns a result dict."""
+    repo_clone_url = payload["repo_clone_url"]
+    base_branch = payload.get("base_branch", "main")
+    fix_branch = payload.get("fix_branch") or f"kiro-minions/{payload['sonar_hash'][:12]}"
+    file_to_fix = payload.get("file_to_fix")
+    description = payload["description"]
+    summary = payload.get("summary", "SonarQube fix")
+    ticket_id = payload.get("ticket_id", "UNKNOWN")
+    ticket_url = payload.get("ticket_url", "")
+    sonar_hash = payload["sonar_hash"]
+
+    with tempfile.TemporaryDirectory(prefix="kiro-minions-") as workdir:
+        workdir = Path(workdir)
+
+        # 1. Clone
+        log.info("=== STEP 1: Clone ===")
+        repo_dir = step_clone(repo_clone_url, base_branch, workdir)
+
+        # 2. Branch
+        log.info("=== STEP 2: Create fix branch ===")
+        step_create_branch(repo_dir, fix_branch)
+
+        # 3-4. Fix + Test loop
+        last_failure: str | None = None
+        tests_passed = False
+
+        for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+            log.info("=== STEP 3: kiro-cli fix (attempt %d/%d) ===", attempt, MAX_FIX_ATTEMPTS)
+            step_kiro_fix(repo_dir, description, file_to_fix, attempt, last_failure)
+
+            log.info("=== STEP 4: Run tests (attempt %d/%d) ===", attempt, MAX_FIX_ATTEMPTS)
+            tests_passed, test_output = step_run_tests(repo_dir)
+
+            if tests_passed:
+                break
+
+            last_failure = test_output
+            log.warning("Attempt %d failed, will retry...", attempt)
+
+            # Reset changes before retrying so kiro starts fresh
+            if attempt < MAX_FIX_ATTEMPTS:
+                _run("git checkout -- .", cwd=repo_dir)
+                _run("git clean -fd", cwd=repo_dir)
+
+        # 5. Commit
+        log.info("=== STEP 5: Commit ===")
+        has_changes = step_commit(repo_dir, summary, ticket_id, sonar_hash)
+        if not has_changes:
+            return {
+                "status": "failed",
+                "reason": "kiro-cli produced no changes",
+                "attempts": MAX_FIX_ATTEMPTS,
+            }
+
+        # 6. Push
+        log.info("=== STEP 6: Push ===")
+        step_push(repo_dir, fix_branch)
+
+        # 7. Open PR
+        log.info("=== STEP 7: Open PR ===")
+        pr_url = step_open_pr(
+            repo_dir, base_branch, fix_branch,
+            summary, ticket_id, ticket_url, sonar_hash,
+        )
+
+    return {
+        "status": "success",
+        "pr_url": pr_url,
+        "tests_passed": tests_passed,
+        "attempts": attempt,
+    }
+
+
+# ---------------------------------------------------------------------------
+# AgentCore Runtime entrypoint
+# ---------------------------------------------------------------------------
+
+
+@app.entrypoint
+async def entrypoint(payload: dict):
+    """AgentCore Runtime invocation handler.
+
+    Receives the TicketPayload from the orchestrator, runs the deterministic
+    pipeline, and yields status messages as the stream response.
+    """
+    log.info("Received payload: ticket_id=%s sonar_hash=%s",
+             payload.get("ticket_id"), payload.get("sonar_hash"))
+
+    yield {"event": {"text": f"Starting fix for {payload.get('ticket_id', 'unknown')}...\n"}}
+
+    try:
+        result = run_pipeline(payload)
+    except Exception as exc:
+        log.exception("Pipeline failed")
+        result = {"status": "failed", "reason": str(exc)}
+
+    yield {"event": {"text": json.dumps(result, indent=2)}}
+
+    log.info("Pipeline result: %s", json.dumps(result))
+
+
+# ---------------------------------------------------------------------------
+# Module entry — run the AgentCore app server
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app.run()
