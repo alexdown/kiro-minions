@@ -7,11 +7,14 @@ Jira ticket (label=sonarqube + sonar-hash:<key>)
   → webhook → API Gateway → Orchestrator (Lambda, Python)
       → parse webhook body directly (no Jira API call)
       → extract structured header (clone URL, base branch, fix branch, file) + sonar_hash label
-      → dedup on sonar_hash; send TicketPayload JSON to AgentCore Runtime
+      → dedup / claim on sonar_hash; enqueue TicketPayload JSON on SQS → return 202
+  → SQS work queue (+ DLQ) → Consumer (Lambda, Python)
+      → invoke AgentCore Runtime with the TicketPayload JSON
   → Runtime (custom container — deterministic pipeline, no outer model loop)
       → git clone → checkout base_branch → create fix_branch
       → kiro-cli headless (brief = ticket description) → run tests
       → retry loop (up to 3 attempts) → commit → push → open PR
+      → write terminal job status (done/failed/tests_failed) to DynamoDB
   → GitHub PR (against base_branch)
 ```
 
@@ -28,6 +31,11 @@ The coding agent is a **deterministic Python script** running in an **AgentCore 
 
 ## Flow
 
+The pipeline is **asynchronous**: the webhook Lambda validates, claims the hash,
+and enqueues the payload, then returns `202` immediately. A separate SQS-triggered
+consumer Lambda invokes the long-running AgentCore Runtime, and the Runtime writes
+its own terminal job status back to DynamoDB.
+
 ```
             webhook (issue created/updated, label=sonarqube + sonar-hash:<key>)
   Jira  ─────────────────────────────────────────────────►  API Gateway
@@ -38,8 +46,21 @@ The coding agent is a **deterministic Python script** running in an **AgentCore 
                                                           │                │
                                                           │ parse webhook  │
                                                           │ body → fields  │
-                                                          │ dedup on hash  │
+                                                          │ claim on hash  │  (DynamoDB, lease)
                                                           │ build payload  │
+                                                          │ enqueue → 202  │
+                                                          └───────┬────────┘
+                                                                  │ sqs:SendMessage
+                                                                  │   (TicketPayload JSON)
+                                                                  ▼
+                                                          ┌────────────────┐
+                                                          │   JobsQueue    │  SQS (+ DLQ, maxReceiveCount=3)
+                                                          └───────┬────────┘
+                                                                  │ event source mapping
+                                                                  ▼
+                                                          ┌────────────────┐
+                                                          │   Consumer     │  (Lambda, Python)
+                                                          │ invoke runtime │
                                                           └───────┬────────┘
                                                                   │ invoke(
                                                                   │   runtimeArn,
@@ -51,27 +72,29 @@ The coding agent is a **deterministic Python script** running in an **AgentCore 
                                             │  (isolated microVM · deterministic script) │
                                             │                                            │
                                             │  agent.py — sequential pipeline:           │
-                                            │    1. git clone (token-auth URL)           │
+                                            │    1. git clone (gh-auth, no token in URL) │
                                             │    2. git checkout -b fix_branch           │
                                             │    3. kiro-cli (headless, brief=desc)      │
                                             │    4. run tests (auto-detect runner)       │
                                             │    5. if fail → reset + retry (≤3x)       │
                                             │    6. git commit + push                    │
                                             │    7. gh pr create                         │
-                                            └───────────────────┬────────────────────────┘
-                                                                  │
-                                                                  ▼
-                                                               GitHub PR
+                                            │    8. write job status → DynamoDB          │
+                                            │       (done + pr_url / failed / tests_failed) │
+                                            └──────────────┬──────────────┬──────────────┘
+                                                           │              │
+                                                           ▼              ▼
+                                                        GitHub PR     DynamoDB (job status)
 ```
 
 ## Layout
 
 ```
-orchestrator/   Lambda: Jira webhook handler + AgentCore Runtime invoker
+orchestrator/   Lambdas: webhook producer (handler.handler) + SQS consumer (handler.sqs_consumer)
 runtime/        AgentCore Runtime container (Dockerfile + deterministic pipeline script)
 agent/          [LEGACY] Original managed-harness definition (kept for reference)
 specs/          Design docs
-deploy/         SAM template (API Gateway + Lambda + DynamoDB)
+deploy/         SAM template (API Gateway + Lambdas + SQS + DLQ + DynamoDB)
 tests/          Unit tests
 ```
 
@@ -124,14 +147,32 @@ sam deploy \
   --capabilities CAPABILITY_IAM
 ```
 
-### 3. Configure secrets
+### 3. Configure the Runtime environment and IAM
 
-The Runtime container needs two env vars (set via AgentCore Runtime environment configuration or the execution role's access to SSM):
+The Runtime container needs these env vars (set via AgentCore Runtime environment
+configuration or the execution role's access to SSM):
 
 | Var | Purpose |
 |-----|---------|
-| `GITHUB_TOKEN` | Clone, push, open PR |
+| `GITHUB_TOKEN` | Clone, push, open PR (read from the environment by a git credential helper — never placed in the clone URL) |
 | `KIRO_API_KEY` | kiro-cli headless auth |
+| `DYNAMODB_TABLE` | Jobs table the runtime writes its terminal status to (share the SAM `JobsTableName` output — the orchestrator and runtime use the **same** table) |
+| `AWS_REGION` | Region for the runtime's DynamoDB client (usually injected automatically) |
+
+**Runtime execution role — DynamoDB permissions (attach out-of-band).** Because
+the runtime now writes its own terminal job status (`done` + `pr_url`, `failed`,
+or `tests_failed`) to the jobs table, its **execution role** needs DynamoDB write
+access. The AgentCore Runtime role is created by `agentcore launch`, **not** by
+this SAM stack, so the template cannot attach it — the operator must add the
+following to the Runtime execution role manually:
+
+| Action | Why |
+|--------|-----|
+| `dynamodb:UpdateItem` | `write_job_status` sets `status` + `pr_url`/`reason` |
+| `dynamodb:PutItem` | defensive (status writes use `UpdateItem` today) |
+| `dynamodb:GetItem` | read-back / future lease inspection |
+
+Resource: the jobs table ARN (the `JobsTableArn` output of the SAM stack).
 
 ### 4. Wire the Jira webhook
 
@@ -141,11 +182,27 @@ Point your Jira webhook at the `WebhookUrl` output from the SAM stack.
 
 | Var | Lives in | Used by |
 |-----|----------|---------|
-| `GITHUB_TOKEN` | Runtime container env | git clone/push, gh pr create |
+| `GITHUB_TOKEN` | Runtime container env | git clone/push, gh pr create (via credential helper, never in argv/URL) |
 | `KIRO_API_KEY` | Runtime container env | kiro-cli headless |
-| `AGENTCORE_RUNTIME_ARN` | Orchestrator Lambda env | which Runtime to invoke |
+| `DYNAMODB_TABLE` | Runtime + both Lambdas env | shared jobs table (claim + terminal status) |
+| `AGENTCORE_RUNTIME_ARN` | Both Lambdas env | which Runtime to invoke |
+| `SQS_QUEUE_URL` | Orchestrator (producer) Lambda env | work queue to enqueue TicketPayloads onto |
+| `LEASE_SECONDS` | Orchestrator (producer) Lambda env | claim lease validity (default `3600`); after it expires a stale `in_flight` row is reclaimable |
 
-The orchestrator needs **no external credentials** beyond AWS IAM (to call AgentCore `Invoke` and DynamoDB).
+The orchestrator and consumer need **no external credentials** beyond AWS IAM: the
+producer calls DynamoDB + SQS `SendMessage`; the consumer calls SQS (receive/delete)
++ AgentCore `InvokeRuntime`; the runtime writes DynamoDB job status (see IAM above).
+
+### Job lifecycle, lease, and TTL
+
+A job row is keyed on `sonar_hash`. The producer's `_claim_job` writes `status=in_flight`
+with a numeric `lease_expires_at = now + LEASE_SECONDS`. A re-dispatch is only claimed
+when the row is absent, `failed`, or `in_flight` **with an expired lease** — so a
+crashed or timed-out consumer cannot wedge a `sonar_hash` forever. The runtime later
+overwrites the row with its terminal status (`done` + `pr_url`, `failed`, or
+`tests_failed`). The DynamoDB table has TTL enabled on `lease_expires_at` for
+best-effort cleanup only; the lease comparison in `_claim_job` is the authoritative
+reclaim gate, independent of when the TTL sweeper runs.
 
 ## Docs
 

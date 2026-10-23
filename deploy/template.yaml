@@ -1,17 +1,29 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  kiro-minions orchestrator — Jira webhook -> API Gateway -> Lambda ->
-  AgentCore Runtime (invoke), with DynamoDB-backed idempotency on sonar_hash.
+  kiro-minions orchestrator — Jira webhook -> API Gateway -> Orchestrator Lambda
+  (validate, claim, enqueue -> 202) -> SQS (+DLQ) -> Consumer Lambda ->
+  AgentCore Runtime (invoke). The AgentCore Runtime runs the deterministic fix
+  pipeline AND writes its own terminal job status to DynamoDB. Idempotency is
+  keyed on sonar_hash with a lease so stale in_flight rows become reclaimable.
 
 Parameters:
   AgentCoreRuntimeArn:
     Type: String
-    Description: ARN of the AgentCore Runtime to invoke (bedrock-agentcore:Invoke).
+    Description: ARN of the AgentCore Runtime to invoke (bedrock-agentcore:InvokeRuntime).
   JiraBaseUrl:
     Type: String
     Default: https://your-org.atlassian.net
     Description: Jira base URL, used to build ticket backlinks.
+  LeaseSeconds:
+    Type: String
+    Default: '3600'
+    Description: >
+      How long a claimed (in_flight) job's lease is valid, in seconds. After it
+      expires, a stale in_flight row is reclaimable by a later webhook so a
+      crashed/timed-out consumer cannot wedge a sonar_hash forever. This is the
+      authoritative reclaim gate (see _claim_job); DynamoDB TTL below is only
+      best-effort row cleanup.
 
 Globals:
   Function:
@@ -31,27 +43,68 @@ Resources:
       KeySchema:
         - AttributeName: sonar_hash
           KeyType: HASH
+      # The numeric `lease_expires_at` attribute already lives on every item
+      # (written by the orchestrator's _claim_job). Enabling TTL on it gives
+      # eventual, best-effort cleanup of old rows. NOTE: the lease comparison in
+      # _claim_job (#l < :now) is the AUTHORITATIVE reclaim gate — a stale
+      # in_flight row becomes claimable the instant its lease expires, regardless
+      # of when DynamoDB's TTL sweeper actually deletes it. TTL here only reclaims
+      # storage; it must not be relied on for correctness.
+      TimeToLiveSpecification:
+        AttributeName: lease_expires_at
+        Enabled: true
+
+  # ---------------------------------------------------------------------------
+  # Work queue (#7): the webhook producer enqueues a TicketPayload JSON and the
+  # ConsumerFunction drains it to invoke the AgentCore Runtime. Messages that
+  # fail delivery maxReceiveCount times are routed to the DLQ.
+  # ---------------------------------------------------------------------------
+  JobsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: kiro-minions-jobs-dlq
+      # Keep failed messages around long enough to inspect/redrive (14 days max).
+      MessageRetentionPeriod: 1209600
+
+  JobsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: kiro-minions-jobs
+      # VisibilityTimeout must be >= the ConsumerFunction Timeout so an in-flight
+      # message is not re-delivered to another consumer mid-processing. AWS
+      # guidance is ~6x the function timeout; ConsumerFunction uses 900s, so we
+      # set 960s (just over the function timeout plus headroom; 6x would exceed
+      # the hard 43200s cap only at much larger timeouts).
+      VisibilityTimeout: 960
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobsDeadLetterQueue.Arn
+        maxReceiveCount: 3
 
   OrchestratorFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: kiro-minions-orchestrator
       CodeUri: ../orchestrator/
+      # Webhook producer entry point: validate, claim, enqueue -> 202.
       Handler: handler.handler
       Environment:
         Variables:
           AGENTCORE_RUNTIME_ARN: !Ref AgentCoreRuntimeArn
           JIRA_BASE_URL: !Ref JiraBaseUrl
           DYNAMODB_TABLE: !Ref JobsTable
+          # SQS work queue the producer enqueues TicketPayloads onto (#7).
+          SQS_QUEUE_URL: !Ref JobsQueue
+          # Lease validity for a claimed in_flight job (#6).
+          LEASE_SECONDS: !Ref LeaseSeconds
       Policies:
-        - Statement:
-            - Sid: InvokeAgentCoreRuntime
-              Effect: Allow
-              Action:
-                - bedrock-agentcore:InvokeRuntime
-              Resource: !Ref AgentCoreRuntimeArn
+        # The producer no longer invokes the AgentCore Runtime synchronously; it
+        # only enqueues. The bedrock-agentcore:InvokeRuntime permission therefore
+        # lives on the ConsumerFunction, not here.
         - DynamoDBCrudPolicy:
             TableName: !Ref JobsTable
+        # Producer only needs to SendMessage to the work queue.
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt JobsQueue.QueueName
       Events:
         Webhook:
           Type: HttpApi
@@ -60,15 +113,84 @@ Resources:
             Path: /webhook
             Method: POST
 
+  # ---------------------------------------------------------------------------
+  # SQS consumer (#7): drains JobsQueue and performs the blocking AgentCore
+  # invoke. The runtime reports its own terminal status to DynamoDB (#6), so the
+  # consumer does NOT block waiting for the whole fix to finish and does NOT
+  # write job status itself — it just invokes and lets SQS retry/DLQ on failure.
+  # Timeout is generous (900s) because the invoke call can be long-running; the
+  # queue VisibilityTimeout above is sized to match so messages are not
+  # re-delivered mid-processing.
+  # ---------------------------------------------------------------------------
+  ConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: kiro-minions-consumer
+      CodeUri: ../orchestrator/
+      Handler: handler.sqs_consumer
+      Timeout: 900
+      Environment:
+        Variables:
+          AGENTCORE_RUNTIME_ARN: !Ref AgentCoreRuntimeArn
+          DYNAMODB_TABLE: !Ref JobsTable
+      Policies:
+        - Statement:
+            - Sid: InvokeAgentCoreRuntime
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:InvokeRuntime
+              Resource: !Ref AgentCoreRuntimeArn
+        # Receive/Delete/GetQueueAttributes on the work queue for the event
+        # source mapping.
+        - SQSPollerPolicy:
+            QueueName: !GetAtt JobsQueue.QueueName
+      Events:
+        JobsQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JobsQueue.Arn
+            # One ticket per invoke keeps a failed fix from poisoning a batch of
+            # unrelated tickets (each message retries/DLQs independently).
+            BatchSize: 1
+
   WebhookApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: $default
+
+# =============================================================================
+# AgentCore Runtime execution role — NOT managed by this stack.
+# -----------------------------------------------------------------------------
+# The AgentCore Runtime (its container + execution role) is created out-of-band
+# by `agentcore launch`, so this SAM stack CANNOT attach IAM to it. Because the
+# runtime now writes its own terminal job status to the JobsTable (#6), the
+# operator MUST attach the following actions to the Runtime EXECUTION ROLE:
+#
+#     dynamodb:UpdateItem   (write_job_status SET of status/pr_url/reason)
+#     dynamodb:PutItem      (defensive; status writes use UpdateItem today)
+#     dynamodb:GetItem      (read-back / future lease inspection)
+#
+#   Resource: the JobsTable ARN (see JobsTableArn output below).
+#
+# The runtime also needs DYNAMODB_TABLE (and AWS_REGION) in its environment.
+# Pass DYNAMODB_TABLE via the AgentCore Runtime env config (see README "Deploy").
+# =============================================================================
 
 Outputs:
   WebhookUrl:
     Description: API Gateway endpoint to configure as the Jira webhook target.
     Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
   JobsTableName:
-    Description: DynamoDB idempotency table name.
+    Description: DynamoDB idempotency / job-status table name.
     Value: !Ref JobsTable
+  JobsTableArn:
+    Description: >
+      DynamoDB table ARN. Attach dynamodb:UpdateItem/PutItem/GetItem on this ARN
+      to the AgentCore Runtime execution role (managed outside this stack).
+    Value: !GetAtt JobsTable.Arn
+  JobsQueueUrl:
+    Description: SQS work-queue URL (producer SQS_QUEUE_URL env var).
+    Value: !Ref JobsQueue
+  JobsDeadLetterQueueArn:
+    Description: DLQ ARN for messages that failed delivery maxReceiveCount times.
+    Value: !GetAtt JobsDeadLetterQueue.Arn
