@@ -69,12 +69,22 @@ def redact(text):  # noqa: ANN001 - accepts str | None
             text = text.replace(value, REDACTION_MASK)
     return text
 
-# Job-state values stored in DynamoDB.
+# Job-state values stored in DynamoDB. These string values MUST stay in sync
+# with the terminal statuses the runtime writes (runtime/agent.py: STATUS_DONE /
+# STATUS_FAILED / STATUS_TESTS_FAILED), otherwise a status the runtime writes
+# can become unrecognised here and wedge the sonar_hash.
 STATUS_IN_FLIGHT = "in_flight"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
+# The runtime writes this when kiro produced no change / the tests never passed.
+# It is a non-success terminal state, but a later webhook must still be able to
+# re-dispatch it (e.g. after the ticket is adjusted), so it is RETRYABLE: only
+# a successful ``done`` permanently blocks re-dispatch.
+STATUS_TESTS_FAILED = "tests_failed"
 
-# Statuses that block a re-dispatch (idempotency).
+# Statuses that block a re-dispatch (idempotency). Only a successful terminal
+# ``done`` (and a live in_flight lease) blocks; ``failed`` and ``tests_failed``
+# are retryable.
 _BLOCKING_STATUSES = {STATUS_IN_FLIGHT, STATUS_DONE}
 
 _dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
@@ -142,13 +152,18 @@ def _claim_job(sonar_hash: str, ticket_id: str) -> bool:
     }
     # A claim succeeds when one of these holds:
     #   * the item does not exist yet,
-    #   * its status is "failed" (a previous run failed -> retry allowed), or
+    #   * its status is "failed" (a previous run failed -> retry allowed),
+    #   * its status is "tests_failed" (the runtime produced no change / the
+    #     tests never passed -> a later webhook may re-dispatch after the ticket
+    #     is adjusted; this is a non-success terminal state, not a dead end), or
     #   * its status is "in_flight" AND its lease has expired (#l < :now) -> the
     #     previous consumer crashed/timed out, so the stale lease is reclaimable.
-    # A "done" row has no matching clause, so it keeps blocking re-dispatch.
+    # A "done" row has no matching clause, so it alone keeps blocking
+    # re-dispatch: only a successful terminal PR permanently wedges the hash.
     cond = (
         "attribute_not_exists(sonar_hash)"
         " OR #s = :failed"
+        " OR #s = :tests_failed"
         " OR (#s = :in_flight AND #l < :now)"
     )
     try:
@@ -158,6 +173,7 @@ def _claim_job(sonar_hash: str, ticket_id: str) -> bool:
             ExpressionAttributeNames={"#s": "status", "#l": "lease_expires_at"},
             ExpressionAttributeValues={
                 ":failed": STATUS_FAILED,
+                ":tests_failed": STATUS_TESTS_FAILED,
                 ":in_flight": STATUS_IN_FLIGHT,
                 ":now": now,
             },

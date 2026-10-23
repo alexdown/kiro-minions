@@ -228,3 +228,35 @@ def test_claim_reclaims_when_failed(monkeypatch):
 
     assert handler._claim_job(SONAR_HASH, "PROJ-15") is True
     assert table.items[SONAR_HASH]["status"] == handler.STATUS_IN_FLIGHT
+
+
+def test_claim_reclaims_when_tests_failed(monkeypatch):
+    # Issue #6 (review v1): the runtime writes ``tests_failed`` on the
+    # no-change / tests-never-passed path. That is a non-success terminal state
+    # but a later webhook must be able to re-dispatch it: it must NOT wedge the
+    # sonar_hash the way a successful ``done`` does. A seeded ``tests_failed``
+    # row with a live (future) lease must still be reclaimable.
+    resource = _use_fresh_table(monkeypatch)
+    table = resource.Table(handler.DYNAMODB_TABLE)
+    table.items[SONAR_HASH] = {
+        "sonar_hash": SONAR_HASH,
+        "status": handler.STATUS_TESTS_FAILED,
+        # future lease: reclaim must hinge on the status, not an expired lease.
+        "lease_expires_at": int(time.time()) + 10_000,
+    }
+
+    assert handler._claim_job(SONAR_HASH, "PROJ-15") is True
+    # The claim overwrote it back to in_flight with a fresh lease.
+    assert table.items[SONAR_HASH]["status"] == handler.STATUS_IN_FLIGHT
+    assert table.items[SONAR_HASH]["lease_expires_at"] > int(time.time())
+
+
+def test_tests_failed_string_matches_runtime_constant():
+    # The reclaimable string must match exactly what runtime/agent.py writes,
+    # otherwise a tests_failed row the runtime records would be unrecognised
+    # here and wedge the hash. conftest puts runtime/ on sys.path.
+    import agent  # noqa: E402 - conftest installs SDK stubs + sys.path first
+
+    assert agent.STATUS_TESTS_FAILED == handler.STATUS_TESTS_FAILED == "tests_failed"
+    assert agent.STATUS_DONE == handler.STATUS_DONE == "done"
+    assert agent.STATUS_FAILED == handler.STATUS_FAILED == "failed"
