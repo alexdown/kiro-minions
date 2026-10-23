@@ -45,9 +45,10 @@ app = BedrockAgentCoreApp()
 # ---------------------------------------------------------------------------
 
 
-def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True,
-         timeout: int = 600) -> subprocess.CompletedProcess:
-    """Run a shell command, log it, and return the result."""
+def _default_runner(cmd: str | list[str], cwd: str | Path | None = None,
+                    check: bool = True,
+                    timeout: int = 600) -> subprocess.CompletedProcess:
+    """Real subprocess-backed runner. Run a shell command, log it, return result."""
     if isinstance(cmd, str):
         shell = True
         display = cmd
@@ -69,6 +70,18 @@ def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True
             f"stderr: {result.stderr[-500:]}"
         )
     return result
+
+
+# Single injectable indirection: tests can replace `RUNNER` (e.g. with a
+# FakeRunner) so no real subprocess is spawned. All call sites go through
+# `_run`, which delegates to whatever `RUNNER` currently points at.
+RUNNER = _default_runner
+
+
+def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True,
+         timeout: int = 600) -> subprocess.CompletedProcess:
+    """Run a command through the injectable RUNNER and return the result."""
+    return RUNNER(cmd, cwd=cwd, check=check, timeout=timeout)
 
 
 def _auth_clone_url(clone_url: str) -> str:
