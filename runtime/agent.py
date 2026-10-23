@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -38,6 +39,44 @@ logging.basicConfig(
 log = logging.getLogger("kiro-minions-agent")
 
 app = BedrockAgentCoreApp()
+
+
+# ---------------------------------------------------------------------------
+# Validation (issue #4: shell-injection defence in depth)
+#
+# These patterns DUPLICATE orchestrator/parser.py on purpose: this module runs
+# in a separate AgentCore Runtime container and cannot import the orchestrator
+# package. Re-validating here means a crafted payload that somehow bypassed the
+# orchestrator still cannot reach a shell command.
+# ---------------------------------------------------------------------------
+
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
+_CLONE_URL_RE = re.compile(
+    r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\.git)?$"
+)
+
+
+def _validate_branch_name(name: str, field: str = "branch") -> str:
+    """Validate a branch name; raise ValueError on any violation."""
+    if name is None or not _BRANCH_RE.match(name):
+        raise ValueError(
+            f"invalid {field}: {name!r} does not match ^[A-Za-z0-9._/-]{{1,200}}$"
+        )
+    if name.startswith("-"):
+        raise ValueError(f"invalid {field}: {name!r} must not start with '-'")
+    if ".." in name:
+        raise ValueError(f"invalid {field}: {name!r} must not contain '..'")
+    return name
+
+
+def _validate_clone_url(url: str, field: str = "repo_clone_url") -> str:
+    """Validate a GitHub HTTPS clone URL; raise ValueError on any violation."""
+    if url is None or not _CLONE_URL_RE.match(url):
+        raise ValueError(
+            f"invalid {field}: {url!r} is not a https://github.com/<owner>/<repo>"
+            " clone URL"
+        )
+    return url
 
 
 # ---------------------------------------------------------------------------
@@ -116,15 +155,22 @@ def step_clone(clone_url: str, base_branch: str, workdir: Path) -> Path:
     repo_name = clone_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
     repo_dir = workdir / repo_name
 
-    _run(f"git clone --branch {base_branch} --single-branch {auth_url} {repo_dir}")
-    _run("git config user.email 'kiro-minions[bot]@users.noreply.github.com'", cwd=repo_dir)
-    _run("git config user.name 'kiro-minions[bot]'", cwd=repo_dir)
+    _run([
+        "git", "clone", "--branch", base_branch, "--single-branch",
+        auth_url, str(repo_dir),
+    ])
+    _run(
+        ["git", "config", "user.email",
+         "kiro-minions[bot]@users.noreply.github.com"],
+        cwd=repo_dir,
+    )
+    _run(["git", "config", "user.name", "kiro-minions[bot]"], cwd=repo_dir)
     return repo_dir
 
 
 def step_create_branch(repo_dir: Path, fix_branch: str) -> None:
     """Create and checkout the fix branch."""
-    _run(f"git checkout -b {fix_branch}", cwd=repo_dir)
+    _run(["git", "checkout", "-b", fix_branch], cwd=repo_dir)
 
 
 def step_kiro_fix(repo_dir: Path, description: str, file_to_fix: str | None,
@@ -170,10 +216,10 @@ def step_run_tests(repo_dir: Path) -> tuple[bool, str]:
 
 def step_commit(repo_dir: Path, summary: str, ticket_id: str, sonar_hash: str) -> bool:
     """Stage all changes and commit. Returns True if there were changes to commit."""
-    _run("git add -A", cwd=repo_dir)
+    _run(["git", "add", "-A"], cwd=repo_dir)
 
     # Check if there's anything to commit
-    result = _run("git diff --cached --quiet", cwd=repo_dir, check=False)
+    result = _run(["git", "diff", "--cached", "--quiet"], cwd=repo_dir, check=False)
     if result.returncode == 0:
         log.warning("No changes to commit — kiro-cli produced no diff.")
         return False
@@ -185,7 +231,7 @@ def step_commit(repo_dir: Path, summary: str, ticket_id: str, sonar_hash: str) -
 
 def step_push(repo_dir: Path, fix_branch: str) -> None:
     """Push the fix branch to origin."""
-    _run(f"git push origin {fix_branch}", cwd=repo_dir)
+    _run(["git", "push", "origin", fix_branch], cwd=repo_dir)
 
 
 def step_open_pr(repo_dir: Path, base_branch: str, fix_branch: str,
@@ -232,6 +278,13 @@ def run_pipeline(payload: dict) -> dict:
     ticket_url = payload.get("ticket_url", "")
     sonar_hash = payload["sonar_hash"]
 
+    # Defence in depth (issue #4): re-validate the ticket-derived values that
+    # flow into git commands BEFORE running any shell command. A ValueError here
+    # fails the pipeline safely before clone/branch/push happen.
+    _validate_clone_url(repo_clone_url)
+    _validate_branch_name(base_branch, field="base_branch")
+    _validate_branch_name(fix_branch, field="fix_branch")
+
     with tempfile.TemporaryDirectory(prefix="kiro-minions-") as workdir:
         workdir = Path(workdir)
 
@@ -262,8 +315,8 @@ def run_pipeline(payload: dict) -> dict:
 
             # Reset changes before retrying so kiro starts fresh
             if attempt < MAX_FIX_ATTEMPTS:
-                _run("git checkout -- .", cwd=repo_dir)
-                _run("git clean -fd", cwd=repo_dir)
+                _run(["git", "checkout", "--", "."], cwd=repo_dir)
+                _run(["git", "clean", "-fd"], cwd=repo_dir)
 
         # 5. Commit
         log.info("=== STEP 5: Commit ===")

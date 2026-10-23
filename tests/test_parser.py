@@ -107,11 +107,12 @@ def test_missing_base_branch_defaults_to_main():
     assert header["fix_branch"] == "sonarqube-fix/foo"
 
 
-def test_clone_url_with_https_containing_port_in_path():
-    # Clone value should be taken verbatim after the colon (only first ':' splits).
+def test_non_github_clone_url_rejected():
+    # After issue #4 strict validation, only https://github.com hosts are
+    # accepted; a GitHub Enterprise host is rejected with a ValueError.
     desc = "Clone: https://ghe.example.com/org/repo.git\n"
-    header = parse_description_header(desc)
-    assert header["repo_clone_url"] == "https://ghe.example.com/org/repo.git"
+    with pytest.raises(ValueError):
+        parse_description_header(desc)
 
 
 def test_extract_sonar_hash_missing_returns_none():
@@ -152,3 +153,98 @@ def test_empty_clone_value_raises():
 def test_none_description_raises():
     with pytest.raises(ValueError):
         parse_description_header(None)
+
+
+# ---------------------------------------------------------------------------
+# Issue #4: strict validation of branch names and clone URLs
+# ---------------------------------------------------------------------------
+
+from parser import (  # noqa: E402
+    validate_branch_name,
+    validate_clone_url,
+)
+
+
+INJECTION_BRANCHES = [
+    "main; rm -rf /",
+    "--upload-pack=evil",
+    "../../etc",
+    "a b",
+    "-malicious",
+    "feature..secret",
+]
+
+
+@pytest.mark.parametrize("bad", INJECTION_BRANCHES)
+def test_validate_branch_name_rejects_injection(bad):
+    with pytest.raises(ValueError):
+        validate_branch_name(bad)
+
+
+def test_validate_branch_name_accepts_good():
+    assert validate_branch_name("sonarqube-fix/xss-swig-autoescape") == (
+        "sonarqube-fix/xss-swig-autoescape"
+    )
+    assert validate_branch_name("master") == "master"
+    assert validate_branch_name("main") == "main"
+
+
+BAD_CLONE_URLS = [
+    "https://x-token:abc@github.com/o/r.git",
+    "http://github.com/o/r",
+    "https://evil.com/o/r.git",
+    "https://github.com/o/r/extra",
+    "git@github.com:o/r.git",
+    "https://github.com/o",
+    "https://github.com/o/r?x=1",
+]
+
+
+@pytest.mark.parametrize("bad", BAD_CLONE_URLS)
+def test_validate_clone_url_rejects_bad(bad):
+    with pytest.raises(ValueError):
+        validate_clone_url(bad)
+
+
+def test_validate_clone_url_accepts_github():
+    assert validate_clone_url("https://github.com/your-org/your-repo") == (
+        "https://github.com/your-org/your-repo"
+    )
+    assert validate_clone_url("https://github.com/your-org/your-repo.git") == (
+        "https://github.com/your-org/your-repo.git"
+    )
+
+
+@pytest.mark.parametrize("bad_branch", INJECTION_BRANCHES)
+def test_parse_header_rejects_injection_base_branch(bad_branch):
+    desc = (
+        "Clone: https://github.com/your-org/your-repo.git\n"
+        f"Base branch: {bad_branch}\n"
+    )
+    with pytest.raises(ValueError):
+        parse_description_header(desc)
+
+
+@pytest.mark.parametrize("bad_branch", INJECTION_BRANCHES)
+def test_parse_header_rejects_injection_fix_branch(bad_branch):
+    desc = (
+        "Clone: https://github.com/your-org/your-repo.git\n"
+        "Base branch: master\n"
+        f"Suggested fix branch: {bad_branch}\n"
+    )
+    with pytest.raises(ValueError):
+        parse_description_header(desc)
+
+
+@pytest.mark.parametrize("bad_url", BAD_CLONE_URLS)
+def test_parse_header_rejects_bad_clone_url(bad_url):
+    desc = f"Clone: {bad_url}\nBase branch: master\n"
+    with pytest.raises(ValueError):
+        parse_description_header(desc)
+
+
+def test_parse_header_accepts_valid_proj15():
+    header = parse_description_header(SW15_DESCRIPTION)
+    assert header["repo_clone_url"] == "https://github.com/your-org/your-repo.git"
+    assert header["base_branch"] == "master"
+    assert header["fix_branch"] == "sonarqube-fix/xss-swig-autoescape"
