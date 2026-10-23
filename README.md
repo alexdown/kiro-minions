@@ -75,6 +75,25 @@ deploy/         SAM template (API Gateway + Lambda + DynamoDB)
 tests/          Unit tests
 ```
 
+## Testing
+
+Dev/test dependencies are pinned in `requirements-dev.txt` (they are **not**
+shipped to the Lambda orchestrator or the Runtime container). Create a
+virtualenv at the repo root, install them, and run the suite:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt && python -m pytest tests/ -q
+```
+
+Once the venv is set up, the recurring one-liner is just:
+
+```bash
+python -m pytest tests/ -q
+```
+
+Tests must never touch real AWS, GitHub, Jira or kiro-cli — use the fakes and
+moto-based fixtures under `tests/`.
+
 ## Example ticket (PROJ-15)
 
 ```
