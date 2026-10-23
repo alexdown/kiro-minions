@@ -29,8 +29,11 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 # ---------------------------------------------------------------------------
 
 MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-KIRO_API_KEY = os.environ.get("KIRO_API_KEY", "")  # kiro-cli reads this directly
+
+# Names of the environment variables whose VALUES must never leak into argv,
+# logs, exceptions, or responses. redact() reads them from os.environ at call
+# time (not cached) so tests can monkeypatch the environment without a reload.
+_SECRET_ENV_VARS = ("GITHUB_TOKEN", "KIRO_API_KEY")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,13 +83,63 @@ def _validate_clone_url(url: str, field: str = "repo_clone_url") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Secret redaction (issue #3)
+# ---------------------------------------------------------------------------
+
+REDACTION_MASK = "***REDACTED***"
+
+
+def redact(text: str | None) -> str | None:
+    """Mask secret values (GITHUB_TOKEN, KIRO_API_KEY) wherever they appear.
+
+    Reads the secret values from ``os.environ`` at call time so the result is
+    never cached at import and tests can set/unset the env freely. Empty or
+    unset env values are skipped (we never mask an empty string). ``None`` input
+    is returned unchanged so callers can pass through optional values safely.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name, "")
+        if value:  # skip empty/unset: never mask the empty string
+            text = text.replace(value, REDACTION_MASK)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Git authentication (issue #3: no token in argv)
+# ---------------------------------------------------------------------------
+
+
+def setup_git_auth() -> None:
+    """Configure git to authenticate via gh, without the token in any argv.
+
+    When GITHUB_TOKEN is set, ``gh auth setup-git`` registers gh as git's
+    credential helper. gh reads the token from the GITHUB_TOKEN/GH_TOKEN
+    environment variable itself, so the token value is never passed as a
+    command-line argument (and never logged, since redact() masks it anyway).
+    """
+    if not os.environ.get("GITHUB_TOKEN"):
+        log.info("GITHUB_TOKEN not set — skipping gh auth setup-git.")
+        return
+    _run(["gh", "auth", "setup-git"])
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
 def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True,
          timeout: int = 600) -> subprocess.CompletedProcess:
-    """Run a shell command, log it, and return the result."""
+    """Run a shell command, log it, and return the result.
+
+    All displayed/logged text (the command line, STDOUT, STDERR) and the
+    RuntimeError raised on non-zero exit are passed through redact() so secret
+    values can never leak into logs or exception messages (issue #3).
+    """
     if isinstance(cmd, str):
         shell = True
         display = cmd
@@ -94,30 +147,20 @@ def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True
         shell = False
         display = " ".join(cmd)
 
-    log.info("RUN: %s (cwd=%s)", display, cwd or ".")
+    log.info("RUN: %s (cwd=%s)", redact(display), cwd or ".")
     result = subprocess.run(
         cmd, shell=shell, cwd=cwd, capture_output=True, text=True, timeout=timeout,
     )
     if result.stdout:
-        log.info("STDOUT:\n%s", result.stdout[-2000:])
+        log.info("STDOUT:\n%s", redact(result.stdout[-2000:]))
     if result.stderr:
-        log.info("STDERR:\n%s", result.stderr[-2000:])
+        log.info("STDERR:\n%s", redact(result.stderr[-2000:]))
     if check and result.returncode != 0:
-        raise RuntimeError(
+        raise RuntimeError(redact(
             f"Command failed (rc={result.returncode}): {display}\n"
             f"stderr: {result.stderr[-500:]}"
-        )
+        ))
     return result
-
-
-def _auth_clone_url(clone_url: str) -> str:
-    """Inject GITHUB_TOKEN into the clone URL for authentication."""
-    if not GITHUB_TOKEN:
-        return clone_url
-    # https://github.com/org/repo.git → https://x-token:<token>@github.com/org/repo.git
-    if clone_url.startswith("https://"):
-        return clone_url.replace("https://", f"https://x-token:{GITHUB_TOKEN}@", 1)
-    return clone_url
 
 
 def _detect_test_command(repo_dir: Path) -> str | None:
@@ -150,14 +193,18 @@ def _detect_test_command(repo_dir: Path) -> str | None:
 
 
 def step_clone(clone_url: str, base_branch: str, workdir: Path) -> Path:
-    """Clone the repo and checkout the base branch."""
-    auth_url = _auth_clone_url(clone_url)
+    """Clone the repo and checkout the base branch.
+
+    The plain validated https URL is used directly — no token is injected into
+    the URL (issue #3). Authentication is handled by git's gh credential helper
+    configured in setup_git_auth().
+    """
     repo_name = clone_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
     repo_dir = workdir / repo_name
 
     _run([
         "git", "clone", "--branch", base_branch, "--single-branch",
-        auth_url, str(repo_dir),
+        clone_url, str(repo_dir),
     ])
     _run(
         ["git", "config", "user.email",
@@ -288,6 +335,10 @@ def run_pipeline(payload: dict) -> dict:
     with tempfile.TemporaryDirectory(prefix="kiro-minions-") as workdir:
         workdir = Path(workdir)
 
+        # 0. Configure git auth via gh (token stays in the env, never in argv).
+        log.info("=== STEP 0: Configure git auth ===")
+        setup_git_auth()
+
         # 1. Clone
         log.info("=== STEP 1: Clone ===")
         repo_dir = step_clone(repo_clone_url, base_branch, workdir)
@@ -362,17 +413,20 @@ async def entrypoint(payload: dict):
     log.info("Received payload: ticket_id=%s sonar_hash=%s",
              payload.get("ticket_id"), payload.get("sonar_hash"))
 
-    yield {"event": {"text": f"Starting fix for {payload.get('ticket_id', 'unknown')}...\n"}}
+    yield {"event": {"text": redact(
+        f"Starting fix for {payload.get('ticket_id', 'unknown')}...\n"
+    )}}
 
     try:
         result = run_pipeline(payload)
     except Exception as exc:
         log.exception("Pipeline failed")
-        result = {"status": "failed", "reason": str(exc)}
+        # str(exc) can echo command output/stderr; redact before it leaves here.
+        result = {"status": "failed", "reason": redact(str(exc))}
 
-    yield {"event": {"text": json.dumps(result, indent=2)}}
+    yield {"event": {"text": redact(json.dumps(result, indent=2))}}
 
-    log.info("Pipeline result: %s", json.dumps(result))
+    log.info("Pipeline result: %s", redact(json.dumps(result)))
 
 
 # ---------------------------------------------------------------------------

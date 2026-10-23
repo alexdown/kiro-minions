@@ -31,6 +31,30 @@ JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "kiro-minions-jobs")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
+# Environment variables whose VALUES must never appear in a response body or log
+# line. These are usually NOT present in the orchestrator's environment, so this
+# is defence in depth (the runtime is the primary secret holder). redact() reads
+# them from os.environ at call time rather than caching at import.
+_SECRET_ENV_VARS = ("GITHUB_TOKEN", "KIRO_API_KEY")
+REDACTION_MASK = "***REDACTED***"
+
+
+def redact(text):  # noqa: ANN001 - accepts str | None
+    """Mask secret env values (GITHUB_TOKEN, KIRO_API_KEY) in a string.
+
+    Skips empty/unset env values (never masks the empty string) and returns
+    ``None`` unchanged so optional error strings pass through safely.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name, "")
+        if value:
+            text = text.replace(value, REDACTION_MASK)
+    return text
+
 # Job-state values stored in DynamoDB.
 STATUS_IN_FLIGHT = "in_flight"
 STATUS_DONE = "done"
@@ -214,7 +238,7 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     try:
         body = _extract_body(event)
     except (ValueError, json.JSONDecodeError) as exc:
-        return _response(400, {"error": f"invalid request body: {exc}"})
+        return _response(400, {"error": redact(f"invalid request body: {exc}")})
 
     issue = body.get("issue") or {}
     fields = issue.get("fields") or {}
@@ -239,13 +263,13 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     try:
         header = parse_description_header(description)
     except ValueError as exc:
-        return _response(400, {"error": str(exc)})
+        return _response(400, {"error": redact(str(exc))})
 
     # --- Idempotency claim ---
     try:
         claimed = _claim_job(sonar_hash, ticket_id)
     except ClientError as exc:
-        return _response(500, {"error": f"dynamodb error: {exc}"})
+        return _response(500, {"error": redact(f"dynamodb error: {exc}")})
 
     if not claimed:
         return _response(
@@ -261,17 +285,22 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     payload = _build_payload(ticket_id, summary, description, header, sonar_hash)
 
     try:
-        result = _invoke_runtime(payload)
+        _invoke_runtime(payload)
     except Exception as exc:  # noqa: BLE001 - report any dispatch failure
-        _mark_status(sonar_hash, STATUS_FAILED, {"error": str(exc)})
-        return _response(500, {"error": f"runtime invocation failed: {exc}"})
+        _mark_status(sonar_hash, STATUS_FAILED, {"error": redact(str(exc))})
+        return _response(
+            500, {"error": redact(f"runtime invocation failed: {exc}")}
+        )
 
+    # NOTE: the raw runtime stream text is intentionally NOT returned to the
+    # caller — it can echo command output or error text that may carry secrets
+    # (issue #3). The dispatch result is surfaced via DynamoDB job status, not
+    # the HTTP body. (FEAT-004 removes this synchronous invoke entirely.)
     return _response(
         200,
         {
             "status": "dispatched",
             "sonar_hash": sonar_hash,
             "ticket_id": ticket_id,
-            "runtime_response": result,
         },
     )
