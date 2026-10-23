@@ -14,14 +14,17 @@ Runs as an AgentCore Runtime container. Exposes /invocations (POST) and
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
+import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
 # ---------------------------------------------------------------------------
@@ -29,6 +32,18 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 # ---------------------------------------------------------------------------
 
 MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
+
+# DynamoDB job table the runtime writes its terminal status to (#6). The
+# orchestrator owns the same table; the runtime needs its own boto3 handle
+# because it runs in a separate container. AWS_REGION is injected by the
+# Runtime environment.
+DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "kiro-minions-jobs")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# Terminal job statuses the runtime writes back.
+STATUS_DONE = "done"
+STATUS_FAILED = "failed"
+STATUS_TESTS_FAILED = "tests_failed"
 
 # Names of the environment variables whose VALUES must never leak into argv,
 # logs, exceptions, or responses. redact() reads them from os.environ at call
@@ -42,6 +57,11 @@ logging.basicConfig(
 log = logging.getLogger("kiro-minions-agent")
 
 app = BedrockAgentCoreApp()
+
+# Module-level DynamoDB resource. Under the test stubs this resolves to the
+# in-memory fake; in production it is the real boto3 resource. Tests monkeypatch
+# ``_dynamodb`` (or point it at a FakeDynamoResource) to inspect writes.
+_dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +145,44 @@ def setup_git_auth() -> None:
         log.info("GITHUB_TOKEN not set — skipping gh auth setup-git.")
         return
     _run(["gh", "auth", "setup-git"])
+
+
+# ---------------------------------------------------------------------------
+# Terminal job status (issue #6: runtime writes its own lifecycle result)
+# ---------------------------------------------------------------------------
+
+
+def write_job_status(sonar_hash: str, status: str,
+                     extra: dict | None = None) -> None:
+    """Write the terminal job status to DynamoDB, keyed by sonar_hash.
+
+    ``status`` is one of ``done`` / ``failed`` / ``tests_failed``. ``extra``
+    carries additional attributes (e.g. ``pr_url`` on success or a REDACTED
+    ``reason`` on failure). This is best-effort: a write failure is logged
+    (redacted) and swallowed so it can never mask or replace the real pipeline
+    result. Nothing written here embeds a secret — callers must redact any
+    free-text ``reason`` before passing it in.
+    """
+    if not sonar_hash:
+        log.warning("write_job_status: missing sonar_hash — skipping status write.")
+        return
+    try:
+        table = _dynamodb.Table(DYNAMODB_TABLE)
+        expr_names = {"#s": "status", "#u": "updated_at"}
+        expr_values = {":s": status, ":u": int(time.time())}
+        set_parts = ["#s = :s", "#u = :u"]
+        for i, (k, v) in enumerate((extra or {}).items()):
+            expr_names[f"#e{i}"] = k
+            expr_values[f":e{i}"] = v
+            set_parts.append(f"#e{i} = :e{i}")
+        table.update_item(
+            Key={"sonar_hash": sonar_hash},
+            UpdateExpression="SET " + ", ".join(set_parts),
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
+        )
+    except Exception as exc:  # noqa: BLE001 - never raise out of a status write
+        log.warning("write_job_status failed: %s", redact(str(exc)))
 
 
 # ---------------------------------------------------------------------------
@@ -413,16 +471,38 @@ async def entrypoint(payload: dict):
     log.info("Received payload: ticket_id=%s sonar_hash=%s",
              payload.get("ticket_id"), payload.get("sonar_hash"))
 
+    sonar_hash = payload.get("sonar_hash")
+
     yield {"event": {"text": redact(
         f"Starting fix for {payload.get('ticket_id', 'unknown')}...\n"
     )}}
 
     try:
-        result = run_pipeline(payload)
+        # #14: run the blocking pipeline off the event loop so /ping health
+        # checks stay responsive for the duration of a long fix.
+        result = await asyncio.to_thread(run_pipeline, payload)
     except Exception as exc:
         log.exception("Pipeline failed")
         # str(exc) can echo command output/stderr; redact before it leaves here.
-        result = {"status": "failed", "reason": redact(str(exc))}
+        reason = redact(str(exc))
+        result = {"status": "failed", "reason": reason}
+        # #6: an unexpected exception is a hard failure.
+        write_job_status(sonar_hash, STATUS_FAILED, {"reason": reason})
+    else:
+        # #6: translate the pipeline result into a terminal DynamoDB status.
+        #   success                 -> done + pr_url
+        #   no-change / tests never  -> tests_failed + redacted reason
+        #     passed (status=failed)
+        if result.get("status") == "success":
+            write_job_status(
+                sonar_hash, STATUS_DONE,
+                {"pr_url": result.get("pr_url", "")},
+            )
+        else:
+            write_job_status(
+                sonar_hash, STATUS_TESTS_FAILED,
+                {"reason": redact(str(result.get("reason", "")))},
+            )
 
     yield {"event": {"text": redact(json.dumps(result, indent=2))}}
 

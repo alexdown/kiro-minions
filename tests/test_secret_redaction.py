@@ -245,40 +245,45 @@ VALID_DESCRIPTION = (
 )
 
 
-def test_handler_dispatch_does_not_echo_runtime_stream(monkeypatch):
-    """A successful dispatch must not return raw runtime stream text."""
+def test_handler_accept_does_not_echo_runtime_stream(monkeypatch):
+    """A successful enqueue (202) must not return raw runtime output.
+
+    FEAT-004 made the webhook async: it enqueues the payload and returns 202
+    without invoking the runtime, so there is no stream text to leak. The body
+    must still carry no secret and no runtime output field.
+    """
     import json as _json
+    from fakes import FakeSqsClient
 
     monkeypatch.setenv("GITHUB_TOKEN", TOKEN_SENTINEL)
-    monkeypatch.setattr(handler, "AGENTCORE_RUNTIME_ARN", "arn:aws:fake")
     monkeypatch.setattr(handler, "_claim_job", lambda h, t: True)
-
-    # The runtime 'stream' echoes the sentinel; the handler must NOT return it.
-    def fake_invoke(payload):
-        return f"runtime log leaked {TOKEN_SENTINEL}"
-
-    monkeypatch.setattr(handler, "_invoke_runtime", fake_invoke)
+    monkeypatch.setattr(handler, "SQS_QUEUE_URL", "https://sqs.fake/queue")
+    monkeypatch.setattr(handler, "_sqs", FakeSqsClient())
 
     resp = handler.handler(_webhook_event(VALID_DESCRIPTION), None)
-    assert resp["statusCode"] == 200
+    assert resp["statusCode"] == 202
     body = _json.loads(resp["body"])
-    assert body["status"] == "dispatched"
+    assert body["status"] == "accepted"
     assert "runtime_response" not in body
     assert TOKEN_SENTINEL not in resp["body"]
 
 
-def test_handler_runtime_failure_error_is_redacted(monkeypatch):
+def test_handler_enqueue_failure_error_is_redacted(monkeypatch):
     import json as _json
+    from fakes import FakeSqsClient
 
     monkeypatch.setenv("GITHUB_TOKEN", TOKEN_SENTINEL)
-    monkeypatch.setattr(handler, "AGENTCORE_RUNTIME_ARN", "arn:aws:fake")
     monkeypatch.setattr(handler, "_claim_job", lambda h, t: True)
     monkeypatch.setattr(handler, "_mark_status", lambda *a, **k: None)
+    monkeypatch.setattr(handler, "SQS_QUEUE_URL", "https://sqs.fake/queue")
 
-    def boom(payload):
-        raise RuntimeError(f"invoke failed: credential {TOKEN_SENTINEL} rejected")
+    sqs = FakeSqsClient()
 
-    monkeypatch.setattr(handler, "_invoke_runtime", boom)
+    def boom(**kwargs):
+        raise RuntimeError(f"send failed: credential {TOKEN_SENTINEL} rejected")
+
+    sqs.send_message = boom
+    monkeypatch.setattr(handler, "_sqs", sqs)
 
     resp = handler.handler(_webhook_event(VALID_DESCRIPTION), None)
     assert resp["statusCode"] == 500

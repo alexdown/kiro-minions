@@ -102,9 +102,42 @@ class FakeDynamoTable:
                 return True
         return False
 
+    def _strip_wrapping_parens(self, clause: str) -> str:
+        """Remove a single pair of balanced parens that wraps the whole clause.
+
+        Unlike ``str.strip('()')`` this never eats the closing paren of a
+        function call like ``attribute_not_exists(x)`` — it only unwraps when the
+        leading ``(`` matches the trailing ``)`` at the very ends of the clause.
+        """
+        clause = clause.strip()
+        while clause.startswith("(") and clause.endswith(")"):
+            depth = 0
+            matched = True
+            for i, ch in enumerate(clause):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and i != len(clause) - 1:
+                        # The opening paren closes before the end -> not a wrap.
+                        matched = False
+                        break
+            if not matched:
+                break
+            clause = clause[1:-1].strip()
+        return clause
+
     def _clause_holds(self, clause: str, existing: dict | None,
                       expr_names: dict, expr_values: dict, now: int) -> bool:
-        clause = clause.strip().strip("()").strip()
+        clause = self._strip_wrapping_parens(clause)
+
+        # Conjunctions: every AND-part must hold. Supports the FEAT-004 reclaim
+        # clause "(#s = :in_flight AND #l < :now)".
+        if " AND " in clause:
+            return all(
+                self._clause_holds(part, existing, expr_names, expr_values, now)
+                for part in clause.split(" AND ")
+            )
 
         if clause.startswith("attribute_not_exists"):
             attr = clause[clause.index("(") + 1:clause.rindex(")")].strip()
