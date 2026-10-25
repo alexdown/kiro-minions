@@ -166,8 +166,15 @@ sam deploy \
   --parameter-overrides \
     AgentCoreRuntimeArn=arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/kiro-minions \
     JiraBaseUrl=https://your-org.atlassian.net \
+    WebhookSecretSsmName=/kiro-minions/webhook-secret \
+    RepoAllowlist='your-org/*' \
   --capabilities CAPABILITY_IAM
 ```
+
+The webhook secret itself is **never** passed on the command line: store it once
+as a SecureString SSM parameter and pass only its *name* via
+`WebhookSecretSsmName`. The template resolves the value at deploy time with
+`{{resolve:ssm-secure:...}}` (see `deploy/template.yaml`).
 
 ### 3. Configure the Runtime environment and IAM
 
@@ -179,6 +186,7 @@ configuration or the execution role's access to SSM):
 | `GITHUB_TOKEN` | Clone, push, open PR (read from the environment by a git credential helper — never placed in the clone URL) |
 | `KIRO_API_KEY` | kiro-cli headless auth |
 | `DYNAMODB_TABLE` | Jobs table the runtime writes its terminal status to (share the SAM `JobsTableName` output — the orchestrator and runtime use the **same** table) |
+| `REPO_ALLOWLIST` | Owner/repo glob patterns the runtime re-checks before cloning (defence in depth; set to the **same** value as the orchestrator's `RepoAllowlist`; empty = allow all) |
 | `AWS_REGION` | Region for the runtime's DynamoDB client (usually injected automatically) |
 
 **Runtime execution role — DynamoDB permissions (attach out-of-band).** Because
@@ -210,6 +218,23 @@ Point your Jira webhook at the `WebhookUrl` output from the SAM stack.
 | `AGENTCORE_RUNTIME_ARN` | Both Lambdas env | which Runtime to invoke |
 | `SQS_QUEUE_URL` | Orchestrator (producer) Lambda env | work queue to enqueue TicketPayloads onto |
 | `LEASE_SECONDS` | Orchestrator (producer) Lambda env | claim lease validity (default `3600`); after it expires a stale `in_flight` row is reclaimable |
+| `WEBHOOK_SECRET` | Orchestrator (producer) Lambda env | webhook shared secret / HMAC key (resolved from SSM at deploy; **never** hardcoded). When set, `verify_webhook` **fails closed** (401 for a missing credential header, 403 for an invalid signature/secret); when empty, verification is skipped (fail-open) for local/direct invokes and unconfigured deployments. All compares use `hmac.compare_digest` (constant-time) |
+| `REPO_ALLOWLIST` | Orchestrator (producer) Lambda env | comma/whitespace separated owner/repo glob patterns; a ticket whose repo is not allowed is rejected 403 before any claim/enqueue. Empty = allow all. Re-checked in the runtime |
+
+### Webhook authentication (`WEBHOOK_SECRET`)
+
+Incoming webhooks are authenticated **before** any body parsing or job claim.
+Two modes are supported, in precedence order:
+
+1. **HMAC signature** — when an `x-hub-signature-256` header is present, the
+   orchestrator computes `hmac-sha256(secret, raw_body)` and compares it
+   (constant-time) against the header (hex, optional `sha256=` prefix).
+2. **Shared secret** — otherwise, an `x-webhook-secret` (or `x-webhook-token`)
+   header is compared (constant-time) against `WEBHOOK_SECRET`.
+
+The secret value never appears in a response body, log line, or exception (it is
+part of `redact()` coverage). API Gateway stage-level throttling defaults
+(`DefaultRouteSettings`) on the HTTP API add a rate/burst cap in front of this.
 
 The orchestrator and consumer need **no external credentials** beyond AWS IAM: the
 producer calls DynamoDB + SQS `SendMessage`; the consumer calls SQS (receive/delete)

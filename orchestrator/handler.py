@@ -12,10 +12,48 @@ Flow:
 A separate SQS-triggered Lambda (``sqs_consumer`` below) drains the queue and
 invokes the AgentCore Runtime with the payload (JSON, not a rendered prompt).
 The runtime writes the terminal job status back to DynamoDB itself.
+
+Webhook authentication (issue #5)
+---------------------------------
+Incoming webhooks are authenticated BEFORE any body parsing or job-claim work,
+with a constant-time compare (``hmac.compare_digest``) for every comparison.
+Two credential modes are supported, in this precedence:
+
+  1. HMAC signature mode: when an ``x-hub-signature-256`` header is present, we
+     compute ``hmac-sha256(secret, raw_body_bytes)`` and compare (constant-time)
+     against the header value (hex, optional ``sha256=`` prefix).
+  2. Shared-secret mode: otherwise, when an ``x-webhook-secret`` (or
+     ``x-webhook-token``) header is present, we compare it (constant-time)
+     against ``WEBHOOK_SECRET``.
+
+Fail-closed policy keyed on whether ``WEBHOOK_SECRET`` is configured:
+
+  * CONFIGURED (non-empty): a webhook with NO recognised credential header is
+    rejected 401 (missing credential); a present-but-invalid signature/secret is
+    rejected 403. A valid credential is accepted.
+  * UNSET/empty: verification is SKIPPED (a redacted warning is logged) so
+    local/direct-invoke and unconfigured deployments keep working. This is the
+    path the existing raw-dict-event tests exercise.
+
+The direct-dict invoke path (an event carrying ``issue`` and no ``body``) has no
+raw body and no signature, so it is treated as a trusted local invoke and is
+allowed regardless of mode. The secret value never reaches a response body, log
+line, or exception: ``WEBHOOK_SECRET`` is part of redact()'s coverage.
+
+Repo allowlist (issue #5)
+-------------------------
+``REPO_ALLOWLIST`` is a comma/whitespace separated list of ``owner/repo`` glob
+patterns (e.g. ``your-org/*``). After the description header parses, the
+orchestrator rejects (403) any ticket whose repo is not allowed BEFORE claiming
+or enqueuing. An empty/unset allowlist means "no allowlist configured" and
+allows all repos (opt-in). The runtime re-checks the same allowlist (defence in
+depth, like the duplicated URL/branch validators).
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import time
@@ -28,6 +66,7 @@ from parser import (
     extract_sonar_hash,
     has_sonarqube_label,
     parse_description_header,
+    repo_allowed,
 )
 
 AGENTCORE_RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
@@ -45,11 +84,29 @@ SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
 # consumer cannot wedge a sonar_hash forever (FEAT-004 #6).
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "3600"))
 
+# Shared secret / HMAC key used to authenticate incoming webhooks (#5). The SAM
+# template injects the RESOLVED secret VALUE here via a dynamic reference (never
+# hardcoded). When empty/unset, webhook verification is skipped (fail-open only
+# for unconfigured deployments / direct invokes); when set, verification is
+# fail-closed. Its value is masked everywhere by redact() (see _SECRET_ENV_VARS).
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+# Comma/whitespace separated owner/repo glob patterns (#5). Empty => allow-all.
+# Parsed once at import, like LEASE_SECONDS.
+def _parse_allowlist(raw: str) -> list[str]:
+    """Split a REPO_ALLOWLIST env string into owner/repo glob patterns."""
+    if not raw:
+        return []
+    return [p for p in raw.replace(",", " ").split() if p]
+
+
+REPO_ALLOWLIST = _parse_allowlist(os.environ.get("REPO_ALLOWLIST", ""))
+
 # Environment variables whose VALUES must never appear in a response body or log
 # line. These are usually NOT present in the orchestrator's environment, so this
 # is defence in depth (the runtime is the primary secret holder). redact() reads
 # them from os.environ at call time rather than caching at import.
-_SECRET_ENV_VARS = ("GITHUB_TOKEN", "KIRO_API_KEY")
+_SECRET_ENV_VARS = ("GITHUB_TOKEN", "KIRO_API_KEY", "WEBHOOK_SECRET")
 REDACTION_MASK = "***REDACTED***"
 
 
@@ -101,11 +158,137 @@ def _response(status_code: int, body: dict) -> dict:
     }
 
 
+# Credential headers (lowercased). HMAC signature takes precedence over the
+# plain shared-secret header when both are present.
+_SIGNATURE_HEADER = "x-hub-signature-256"
+_SECRET_HEADERS = ("x-webhook-secret", "x-webhook-token")
+
+
+class WebhookAuthError(Exception):
+    """Raised when webhook authentication fails.
+
+    ``status_code`` is 401 (no recognised credential header) or 403 (a credential
+    was presented but did not verify). The message carries no secret value.
+    """
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _raw_body_and_headers(event: dict) -> tuple[str | None, dict]:
+    """Return the raw request body string and lowercased-key headers.
+
+    The body is returned EXACTLY as received (after base64 decode when
+    ``event['isBase64Encoded']`` is set) and BEFORE any JSON parsing, which is
+    what HMAC/secret verification needs. For a direct-dict invoke (an event that
+    carries ``issue`` and no ``body``) there is no raw body to verify, so the raw
+    body is ``None``. Header keys are lowercased (API Gateway HTTP API already
+    lowercases them, but we normalise defensively).
+
+    Review finding #5 (KEEP IN SYNC): the base64/body-shape decoding here MUST
+    mirror ``_extract_body`` below so the bytes HMAC signs are exactly the bytes
+    that later get JSON-parsed. See ``_extract_body`` for the full note.
+    """
+    if event is None:
+        raise ValueError("empty event")
+
+    headers = {
+        str(k).lower(): v for k, v in (event.get("headers") or {}).items()
+    }
+
+    # Direct invocation already shaped like a Jira webhook body: no raw body.
+    if "issue" in event and "body" not in event:
+        return None, headers
+
+    body = event.get("body")
+    if body is None:
+        raise ValueError("event has no 'body'")
+
+    if event.get("isBase64Encoded"):
+        import base64
+
+        body = base64.b64decode(body).decode("utf-8")
+
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8")
+
+    if isinstance(body, str):
+        return body, headers
+    # A dict body (some direct-invoke shapes) has no stable raw encoding to sign;
+    # treat it as having no raw body for verification purposes.
+    if isinstance(body, dict):
+        return None, headers
+    raise ValueError(f"unsupported body type: {type(body)!r}")
+
+
+def verify_webhook(raw_body: str | None, headers: dict) -> None:
+    """Authenticate an incoming webhook; raise WebhookAuthError on failure.
+
+    No-ops when ``WEBHOOK_SECRET`` is unset/empty (fail-open for unconfigured
+    deployments) or when there is no raw body (direct/local invoke). Otherwise
+    fails closed: see the module docstring for the precise 401/403 policy. All
+    comparisons use ``hmac.compare_digest`` (constant-time).
+    """
+    secret = WEBHOOK_SECRET
+    if not secret:
+        # Unconfigured: skip verification but surface a redacted warning so an
+        # accidentally-unprotected deployment is visible in the logs.
+        print(redact("WEBHOOK_SECRET not configured — skipping webhook verification"))
+        return
+
+    # Direct/local invoke (no raw body): nothing to sign, treat as trusted.
+    if raw_body is None:
+        return
+
+    headers = headers or {}
+    secret_bytes = secret.encode("utf-8")
+
+    # 1. HMAC signature mode (preferred when the signature header is present).
+    signature = headers.get(_SIGNATURE_HEADER)
+    if signature:
+        provided = signature.strip()
+        if provided.lower().startswith("sha256="):
+            provided = provided[len("sha256="):]
+        # Review finding #3: hexdigest() is lowercase, so a sender supplying
+        # UPPERCASE hex (GitHub always sends lowercase, but non-GitHub senders
+        # may not) would be rejected 403. Case-fold the provided hex before the
+        # constant-time compare. Hex is case-insensitive, so this does not weaken
+        # the check; compare_digest still runs over equal-length lowercase hex.
+        provided = provided.lower()
+        expected = hmac.new(
+            secret_bytes, raw_body.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(provided, expected):
+            raise WebhookAuthError(403, "invalid webhook signature")
+        return
+
+    # 2. Shared-secret header mode.
+    for name in _SECRET_HEADERS:
+        provided = headers.get(name)
+        if provided is not None:
+            if not hmac.compare_digest(provided.encode("utf-8"), secret_bytes):
+                raise WebhookAuthError(403, "invalid webhook secret")
+            return
+
+    # Configured secret but no credential header at all -> missing credential.
+    raise WebhookAuthError(401, "missing webhook signature/secret header")
+
+
 def _extract_body(event: dict) -> dict:
     """Pull and JSON-parse the request body from an API Gateway event.
 
     Handles both raw-dict events (direct invoke) and API Gateway proxy events
     where the body is a JSON string (optionally base64-encoded).
+
+    Review finding #5 (KEEP IN SYNC): the base64/body-shape decoding here MUST
+    mirror ``_raw_body_and_headers`` above. They are deliberately separate: that
+    one returns the raw PRE-JSON bytes HMAC needs, this one returns the PARSED
+    dict. Verification signs the exact bytes returned by ``_raw_body_and_headers``
+    and this function must not alter those bytes before parsing, or a signed body
+    could parse to something the signature never covered. Any change to the
+    base64/isBase64Encoded/bytes handling in one of these two functions must be
+    made in the other, or the sign-then-parse contract breaks.
     """
     if event is None:
         raise ValueError("empty event")
@@ -319,6 +502,20 @@ def sqs_consumer(event, context):  # noqa: ANN001 - Lambda signature
 
 def handler(event, context):  # noqa: ANN001 - Lambda signature
     """Lambda entry point."""
+    # --- Authenticate the webhook BEFORE any parsing/claim work (#5) ---
+    # Verify against the raw body + headers first so an unauthenticated request
+    # never reaches JSON parsing, the label gate, or a job claim (fail closed
+    # early). The secret value is never echoed into the response.
+    try:
+        raw_body, req_headers = _raw_body_and_headers(event)
+    except ValueError as exc:
+        return _response(400, {"error": redact(f"invalid request body: {exc}")})
+
+    try:
+        verify_webhook(raw_body, req_headers)
+    except WebhookAuthError as exc:
+        return _response(exc.status_code, {"error": redact(str(exc))})
+
     # --- Parse incoming webhook body ---
     try:
         body = _extract_body(event)
@@ -349,6 +546,18 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
         header = parse_description_header(description)
     except ValueError as exc:
         return _response(400, {"error": redact(str(exc))})
+
+    # --- Repo allowlist gate (#5) ---
+    # Reject a disallowed repo with 403 BEFORE any claim or enqueue, so it never
+    # wedges a sonar_hash or reaches the work queue. owner/repo is not a secret,
+    # so it is safe to name in the reason (still routed through redact()).
+    if not repo_allowed(header["repo_clone_url"], REPO_ALLOWLIST):
+        return _response(
+            403,
+            {"error": redact(
+                f"repo not in allowlist: {header['repo_clone_url']}"
+            )},
+        )
 
     # --- Idempotency claim ---
     try:

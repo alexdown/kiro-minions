@@ -7,6 +7,7 @@ from the labels array.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 
 # Mapping of (lowercased) line-prefix key -> payload field name.
@@ -75,6 +76,53 @@ def validate_clone_url(url: str, field: str = "repo_clone_url") -> str:
             " clone URL"
         )
     return url
+
+
+# A repo reference extracted from a validated clone URL: owner/repo (no .git).
+# Reuses the same host/shape as _CLONE_URL_RE but captures owner + repo.
+_REPO_OWNER_RE = re.compile(
+    r"^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?$"
+)
+
+
+def _owner_repo(clone_url: str) -> str | None:
+    """Extract the lowercased ``owner/repo`` from a validated clone URL.
+
+    Returns ``None`` when the URL does not match the expected github.com shape
+    (callers should have validated it with ``validate_clone_url`` first).
+    """
+    if clone_url is None:
+        return None
+    match = _REPO_OWNER_RE.match(clone_url)
+    if not match:
+        return None
+    owner, repo = match.group(1), match.group(2)
+    return f"{owner}/{repo}".lower()
+
+
+def repo_allowed(repo_clone_url: str, allowlist: list[str] | None) -> bool:
+    """Return True if the repo's ``owner/repo`` matches the allowlist.
+
+    ``allowlist`` is a list of ``owner/repo`` glob patterns (e.g. ``your-org/*``
+    or ``your-org/your-repo``), matched case-insensitively with
+    ``fnmatch.fnmatchcase`` against the lowercased ``owner/repo`` extracted from
+    the clone URL. An empty/``None`` allowlist means "no allowlist configured"
+    and allows ALL repos (the allowlist is opt-in). This is a SEPARATE check
+    from ``validate_clone_url`` (which only enforces the github.com URL shape).
+
+    A clone URL whose owner/repo cannot be extracted is rejected when an
+    allowlist is configured (fail closed), and allowed when it is not.
+    """
+    if not allowlist:
+        return True
+    owner_repo = _owner_repo(repo_clone_url)
+    if owner_repo is None:
+        return False
+    return any(
+        fnmatch.fnmatchcase(owner_repo, pattern.strip().lower())
+        for pattern in allowlist
+        if pattern and pattern.strip()
+    )
 
 
 def parse_description_header(description: str) -> dict:

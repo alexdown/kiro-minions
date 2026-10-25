@@ -134,9 +134,16 @@ def _full_pipeline_runner() -> RecordingRunner:
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # config email
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # config name
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # checkout -b
+    runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout=""))  # status post-clone
+    # Dependency install is skipped (no ecosystem files in the un-cloned tree).
+    runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout=""))  # status post-install
+    # A BASELINE pytest run (#9) happens before the first kiro-cli fix.
+    runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout="ok"))  # baseline pytest
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # kiro-cli
     runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout="ok"))  # pytest
-    runner.queue_result(FakeCompletedProcess(None, returncode=0))  # git add -A
+    # Scoped staging (#13): post-fix status reports one kiro-changed file.
+    runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout=" M server.js\n"))  # status post-fix
+    runner.queue_result(FakeCompletedProcess(None, returncode=0))  # git add -- server.js
     runner.queue_result(FakeCompletedProcess(None, returncode=1))  # diff: changes
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # commit
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # push

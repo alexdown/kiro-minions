@@ -6,6 +6,10 @@ Description: >
   AgentCore Runtime (invoke). The AgentCore Runtime runs the deterministic fix
   pipeline AND writes its own terminal job status to DynamoDB. Idempotency is
   keyed on sonar_hash with a lease so stale in_flight rows become reclaimable.
+  NOTE (review finding #6): this template (SSM-secure WEBHOOK_SECRET dynamic
+  reference, DefaultRouteSettings throttling, DLQ/visibility sizing) could not be
+  `sam validate`d in the build sandbox (no sam/AWS CLI/PyYAML). Validate it in CI
+  / the deploy pipeline (`sam validate --lint`) before relying on it.
 
 Parameters:
   AgentCoreRuntimeArn:
@@ -24,6 +28,28 @@ Parameters:
       crashed/timed-out consumer cannot wedge a sonar_hash forever. This is the
       authoritative reclaim gate (see _claim_job); DynamoDB TTL below is only
       best-effort row cleanup.
+  # Webhook authentication secret (#5). We take the NAME of a SecureString SSM
+  # parameter here (not the secret itself) and resolve its VALUE at deploy time
+  # via the {{resolve:ssm-secure:...}} dynamic reference below, so the secret is
+  # NEVER hardcoded in the template or in stack parameters history. (Secrets
+  # Manager would work equally well via {{resolve:secretsmanager:...}}; the SSM
+  # SecureString route is the simpler/cheaper option.)
+  WebhookSecretSsmName:
+    Type: String
+    Default: /kiro-minions/webhook-secret
+    Description: >
+      Name of a SecureString SSM parameter holding the webhook shared
+      secret / HMAC key. Its VALUE is injected into the orchestrator as
+      WEBHOOK_SECRET; the value itself is never stored in this template.
+  RepoAllowlist:
+    Type: String
+    Default: ''
+    Description: >
+      Comma/whitespace separated owner/repo glob patterns (e.g.
+      "your-org/* other-org/repo") the orchestrator will accept. Empty means
+      no allowlist (allow all repos). Injected as REPO_ALLOWLIST on the
+      orchestrator; the AgentCore Runtime re-checks the same value set
+      out-of-band on its own env (defence in depth).
 
 Globals:
   Function:
@@ -96,6 +122,14 @@ Resources:
           SQS_QUEUE_URL: !Ref JobsQueue
           # Lease validity for a claimed in_flight job (#6).
           LEASE_SECONDS: !Ref LeaseSeconds
+          # Webhook shared secret / HMAC key (#5). The RESOLVED secret VALUE is
+          # pulled from the SecureString SSM parameter at deploy time; the secret
+          # is never hardcoded here. verify_webhook() fails closed when this is
+          # set and skips verification (fail-open) when it is empty.
+          WEBHOOK_SECRET: !Sub '{{resolve:ssm-secure:${WebhookSecretSsmName}}}'
+          # Owner/repo allowlist (#5); empty => allow all. The runtime enforces
+          # the same list via its own out-of-band REPO_ALLOWLIST env var.
+          REPO_ALLOWLIST: !Ref RepoAllowlist
       Policies:
         # The producer no longer invokes the AgentCore Runtime synchronously; it
         # only enqueues. The bedrock-agentcore:InvokeRuntime permission therefore
@@ -157,6 +191,15 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: $default
+      # API Gateway throttling defaults (#5). AWS::Serverless::HttpApi exposes
+      # stage-level default route throttling via DefaultRouteSettings
+      # (ThrottlingBurstLimit / ThrottlingRateLimit), which SAM maps onto the
+      # HTTP API $default stage. This caps request bursts/sustained rate across
+      # all routes so a flood of webhook calls cannot overwhelm the orchestrator
+      # (defence in depth alongside verify_webhook). Tune to expected Jira load.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
 
 # =============================================================================
 # AgentCore Runtime execution role — NOT managed by this stack.

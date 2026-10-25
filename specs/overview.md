@@ -86,6 +86,8 @@ The workflow steps are executed by **deterministic code**, not by a model reason
 ### Orchestrator (`orchestrator/`)
 Python Lambda behind API Gateway, triggered by the Jira webhook.
 
+- **Authenticates the webhook first (#5):** when `WEBHOOK_SECRET` is configured, the orchestrator verifies an `x-hub-signature-256` HMAC (preferred) or an `x-webhook-secret`/`x-webhook-token` shared-secret header with a constant-time compare (`hmac.compare_digest`) **before** parsing the body or claiming a job. It fails closed (401 missing credential / 403 invalid). When `WEBHOOK_SECRET` is empty it skips verification (fail-open for local/direct invokes). API Gateway default-route throttling caps request rate in front of this.
+- **Repo allowlist (#5):** after the header parses, a ticket whose `owner/repo` is not matched by `REPO_ALLOWLIST` (owner/repo globs; empty = allow all) is rejected 403 before any claim/enqueue. The runtime re-checks the same allowlist (defence in depth).
 - Validates the incoming webhook body; ignores events without the `sonarqube` / `SONARQUBE-FIX` label.
 - **Parses the webhook body directly** — `issue.key`, `issue.fields.summary`, `issue.fields.description`, and `issue.fields.labels` are all present. No Jira API call needed.
 - From the description's **Part 1 header block**, extracts: `Clone`, `Base branch`, `File to fix`, `Suggested fix branch` (see [payload.md](payload.md)).

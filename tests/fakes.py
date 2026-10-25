@@ -369,12 +369,17 @@ class RecordingRunner:
 
     def __call__(self, args: Any, shell: bool = False, cwd: Any = None,
                  capture_output: bool = False, text: bool = False,
-                 timeout: Any = None, **kwargs: Any) -> FakeCompletedProcess:
+                 timeout: Any = None, input: Any = None,
+                 **kwargs: Any) -> FakeCompletedProcess:
+        # ``input`` (process STDIN) is recorded explicitly (#11) so tests can
+        # assert the kiro-cli brief was delivered via stdin, not argv. Defaults
+        # to None so every existing call site keeps working unchanged.
         self.calls.append({
             "args": args,
             "shell": shell,
             "cwd": str(cwd) if cwd is not None else None,
             "timeout": timeout,
+            "input": input,
             "kwargs": kwargs,
         })
         if self._queue:
@@ -401,6 +406,9 @@ class RecordingRunner:
                 parts.extend(str(a) for a in args)
             else:
                 parts.append(str(args))
+            # Include recorded STDIN so secret scans also cover the brief (#11).
+            if call.get("input") is not None:
+                parts.append(str(call["input"]))
         return "\n".join(parts)
 
     def contains(self, needle: str) -> bool:
@@ -421,6 +429,9 @@ class CallRecord:
     check: bool = True
     timeout: int | None = None
     env: dict | None = None
+    # Process STDIN forwarded by agent._run (#11). None for commands that do not
+    # feed stdin (everything except the kiro-cli brief).
+    input: str | None = None
 
     @property
     def display(self) -> str:
@@ -443,6 +454,11 @@ class ScriptedResult:
     stdout: str = ""
     stderr: str = ""
     match: str | None = None
+    # Optional exception INSTANCE to raise instead of returning a result. Lets a
+    # test make a matched call (e.g. the kiro-cli step) raise
+    # subprocess.TimeoutExpired so the per-attempt timeout-catch path (#10) is
+    # exercised faithfully.
+    raises: BaseException | None = None
 
 
 class FakeRunner:
@@ -487,13 +503,23 @@ class FakeRunner:
             else:
                 self._matchers.append(scripted)
 
-    def __call__(self, cmd, cwd=None, check=True, timeout=600):
+    def __call__(self, cmd, cwd=None, check=True, timeout=600, input=None):
+        # ``input`` (process STDIN) defaults to None so every existing call site
+        # keeps working; it is recorded so tests can assert the kiro-cli brief
+        # went via stdin, not argv (#11).
         record = CallRecord(
             cmd=cmd, cwd=cwd, check=check, timeout=timeout, env=self._env,
+            input=input,
         )
         self.calls.append(record)
 
         scripted = self._select(record.display)
+
+        if scripted.raises is not None:
+            # Exercise the per-attempt timeout-catch path (#10): raise the
+            # scripted exception (e.g. subprocess.TimeoutExpired) as a real
+            # subprocess.run would on timeout.
+            raise scripted.raises
 
         if check and scripted.returncode != 0:
             raise RuntimeError(
