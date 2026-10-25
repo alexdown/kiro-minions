@@ -190,13 +190,17 @@ def write_job_status(sonar_hash: str, status: str,
 # ---------------------------------------------------------------------------
 
 
-def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True,
-         timeout: int = 600) -> subprocess.CompletedProcess:
-    """Run a shell command, log it, and return the result.
+def _default_runner(cmd: str | list[str], cwd: str | Path | None = None,
+                    check: bool = True,
+                    timeout: int = 600) -> subprocess.CompletedProcess:
+    """Real subprocess-backed runner. Run a command, log it, and return the result.
 
-    All displayed/logged text (the command line, STDOUT, STDERR) and the
-    RuntimeError raised on non-zero exit are passed through redact() so secret
-    values can never leak into logs or exception messages (issue #3).
+    A list ``cmd`` runs with ``shell=False`` (the only safe form for any
+    ticket-derived command, issue #4); a str ``cmd`` runs with ``shell=True``
+    and is used ONLY for the auto-detected test command, which never contains
+    ticket data. All displayed/logged text (the command line, STDOUT, STDERR)
+    and the RuntimeError raised on non-zero exit are passed through redact() so
+    secret values can never leak into logs or exception messages (issue #3).
     """
     if isinstance(cmd, str):
         shell = True
@@ -219,6 +223,23 @@ def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True
             f"stderr: {result.stderr[-500:]}"
         ))
     return result
+
+
+# Single injectable indirection: tests can replace `RUNNER` (e.g. with a
+# FakeRunner) so no real subprocess is spawned. All call sites go through
+# `_run`, which delegates to whatever `RUNNER` currently points at.
+#
+# NOTE: there is deliberately NO _auth_clone_url helper. The token must never
+# be injected into the clone URL (issue #3); git authenticates via the gh
+# credential helper configured in setup_git_auth(), which reads GITHUB_TOKEN
+# from the environment and keeps it out of argv and out of any logged URL.
+RUNNER = _default_runner
+
+
+def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True,
+         timeout: int = 600) -> subprocess.CompletedProcess:
+    """Run a command through the injectable RUNNER and return the result."""
+    return RUNNER(cmd, cwd=cwd, check=check, timeout=timeout)
 
 
 def _detect_test_command(repo_dir: Path) -> str | None:

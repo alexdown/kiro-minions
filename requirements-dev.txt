@@ -1,0 +1,5 @@
+# Dev/test-only dependencies. NOT shipped to the Lambda orchestrator or the
+# AgentCore Runtime container (those have their own requirements.txt).
+pytest==9.1.1
+moto==5.2.4
+boto3==1.43.118

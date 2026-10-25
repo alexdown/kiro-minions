@@ -98,6 +98,28 @@ deploy/         SAM template (API Gateway + Lambdas + SQS + DLQ + DynamoDB)
 tests/          Unit tests
 ```
 
+## Testing
+
+Dev/test dependencies are pinned in `requirements-dev.txt` (they are **not**
+shipped to the Lambda orchestrator or the Runtime container). Create a
+virtualenv at the repo root, install them, and run the suite:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt && python -m pytest tests/ -q
+```
+
+Once the venv is set up, the recurring one-liner is just:
+
+```bash
+python -m pytest tests/ -q
+```
+
+Tests must never touch real AWS, GitHub, Jira or kiro-cli — use the in-memory
+fakes and SDK stubs under `tests/` (`tests/fakes.py` + `tests/conftest.py`).
+The stubs inject fake `boto3` / `botocore` / `bedrock_agentcore` modules into
+`sys.modules` so the suite runs with zero installs, which is why
+`requirements-dev.txt` is only needed if you want the real SDKs available.
+
 ## Example ticket (PROJ-15)
 
 ```

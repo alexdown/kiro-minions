@@ -9,13 +9,23 @@ before any test imports the production modules.
 
 Everything here is standard library only. No fake performs real network, AWS,
 GitHub, Jira, or kiro-cli calls.
+
+Two families of test doubles live here:
+
+* SDK stubs + in-memory service fakes (``install_sdk_stubs``, FakeDynamoTable /
+  FakeDynamoResource, FakeSqsClient, FakeAgentCoreClient, RecordingRunner) used
+  by the step-2 async-flow / lifecycle / security tests.
+* ``FakeRunner`` / ``ScriptedResult`` / ``CallRecord`` — a scripted drop-in for
+  ``agent.RUNNER`` used by the step-1 characterization tests (test_agent.py).
 """
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 import types
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -285,14 +295,30 @@ class FakeAgentCoreClient:
 
     Returns a canned response with a readable ``body`` so callers that aggregate
     the stream/body get deterministic text without any network.
+
+    Exposes both ``invocations`` (step-2 naming) and ``calls`` (step-1 naming)
+    views over the same recorded data so either suite can introspect it, and
+    records each call's ``runtimeArn`` / ``runtimeSessionId`` / ``payload`` as
+    top-level keys for the step-1 handler characterization assertions.
     """
 
     def __init__(self, response_text: str = '{"status": "ok"}') -> None:
-        self.invocations: list[dict] = []
+        self.calls: list[dict] = []
         self.response_text = response_text
 
-    def invoke(self, **kwargs: Any) -> dict:
-        self.invocations.append(dict(kwargs))
+    # ``invocations`` is an alias kept for step-2 call sites.
+    @property
+    def invocations(self) -> list[dict]:
+        return self.calls
+
+    def invoke(self, runtimeArn=None, runtimeSessionId=None,  # noqa: N803
+               payload=None, **kwargs: Any) -> dict:
+        self.calls.append({
+            "runtimeArn": runtimeArn,
+            "runtimeSessionId": runtimeSessionId,
+            "payload": payload,
+            **kwargs,
+        })
         return {"body": _FakeStreamingBody(self.response_text.encode("utf-8"))}
 
 
@@ -379,6 +405,134 @@ class RecordingRunner:
 
     def contains(self, needle: str) -> bool:
         return needle in self.flat_text()
+
+
+# ---------------------------------------------------------------------------
+# Scripted runner for agent.RUNNER (step-1 characterization tests)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CallRecord:
+    """A single recorded invocation of the scripted runner."""
+
+    cmd: str | list[str]
+    cwd: object = None
+    check: bool = True
+    timeout: int | None = None
+    env: dict | None = None
+
+    @property
+    def display(self) -> str:
+        """Human-readable command string (mirrors agent._default_runner)."""
+        if isinstance(self.cmd, (list, tuple)):
+            return " ".join(str(part) for part in self.cmd)
+        return str(self.cmd)
+
+
+@dataclass
+class ScriptedResult:
+    """A scripted outcome for a runner call.
+
+    If `match` is set, the result only applies to commands whose display string
+    contains that substring. If `match` is None the result is part of the
+    ordered fallback queue consumed in sequence.
+    """
+
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+    match: str | None = None
+
+
+class FakeRunner:
+    """Callable stand-in for ``agent.RUNNER``.
+
+    Usage::
+
+        runner = FakeRunner(
+            results=[ScriptedResult(stdout="https://github.com/o/r/pull/1",
+                                    match="gh pr create")],
+        )
+        agent.RUNNER = runner
+
+    Matching strategy for each call:
+      1. First unconsumed substring-matched ``ScriptedResult`` whose ``match``
+         appears in the command display string.
+      2. Otherwise the next item from the ordered fallback queue (results with
+         ``match is None``).
+      3. Otherwise a default success (rc=0, empty stdout/stderr).
+
+    When the chosen result has a non-zero returncode and ``check=True`` the
+    runner raises ``RuntimeError`` mirroring ``agent._default_runner`` so that
+    retry / failure paths are exercised faithfully.
+    """
+
+    def __init__(self, results=None, env=None):
+        self.calls: list[CallRecord] = []
+        self._matchers: list[ScriptedResult] = []
+        self._queue: list[ScriptedResult] = []
+        self._env = dict(env) if env else None
+        for res in results or []:
+            if isinstance(res, ScriptedResult):
+                scripted = res
+            elif isinstance(res, dict):
+                scripted = ScriptedResult(**res)
+            elif isinstance(res, (tuple, list)):
+                scripted = ScriptedResult(*res)
+            else:
+                raise TypeError(f"unsupported scripted result: {res!r}")
+            if scripted.match is None:
+                self._queue.append(scripted)
+            else:
+                self._matchers.append(scripted)
+
+    def __call__(self, cmd, cwd=None, check=True, timeout=600):
+        record = CallRecord(
+            cmd=cmd, cwd=cwd, check=check, timeout=timeout, env=self._env,
+        )
+        self.calls.append(record)
+
+        scripted = self._select(record.display)
+
+        if check and scripted.returncode != 0:
+            raise RuntimeError(
+                f"Command failed (rc={scripted.returncode}): {record.display}\n"
+                f"stderr: {scripted.stderr[-500:]}"
+            )
+
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=scripted.returncode,
+            stdout=scripted.stdout,
+            stderr=scripted.stderr,
+        )
+
+    def _select(self, display: str) -> ScriptedResult:
+        for i, scripted in enumerate(self._matchers):
+            if scripted.match in display:
+                return self._matchers.pop(i)
+        if self._queue:
+            return self._queue.pop(0)
+        return ScriptedResult()
+
+    # -- convenience accessors for assertions -------------------------------
+
+    @property
+    def commands(self) -> list[str]:
+        """Display strings for every recorded call, in order."""
+        return [c.display for c in self.calls]
+
+    def find(self, substring: str) -> CallRecord | None:
+        """Return the first recorded call whose display contains ``substring``."""
+        for call in self.calls:
+            if substring in call.display:
+                return call
+        return None
+
+    def count(self, substring: str) -> int:
+        """Number of recorded calls whose display contains ``substring``."""
+        return sum(1 for call in self.calls if substring in call.display)
 
 
 # ---------------------------------------------------------------------------
