@@ -7,6 +7,8 @@ from the labels array.
 
 from __future__ import annotations
 
+import re
+
 # Mapping of (lowercased) line-prefix key -> payload field name.
 # Parsing is line-prefix based and case-insensitive on the keys.
 _HEADER_KEYS = {
@@ -17,6 +19,62 @@ _HEADER_KEYS = {
 }
 
 _SONAR_HASH_PREFIX = "sonar-hash:"
+
+# ---------------------------------------------------------------------------
+# Validation (issue #4: shell-injection defence)
+#
+# Ticket-derived values (branch names, clone URL) flow directly into git/gh
+# commands in the runtime. They MUST be validated strictly before use. These
+# patterns are intentionally conservative; the same logic is DUPLICATED in
+# runtime/agent.py (which runs in a separate container and cannot import this
+# module) for defence in depth.
+# ---------------------------------------------------------------------------
+
+# A branch name: 1-200 chars from a tight allow-list. Additional rules (no
+# leading '-', no '..' substring) are enforced separately below.
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
+
+# A clone URL: exactly https://github.com/<owner>/<repo> with an optional single
+# trailing ".git". No userinfo/@, no port, no query, no fragment, no extra path
+# segments. <owner> and <repo> use a conservative GitHub-name allow-list.
+_CLONE_URL_RE = re.compile(
+    r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\.git)?$"
+)
+
+
+def validate_branch_name(name: str, field: str = "branch") -> str:
+    """Validate a git branch name against the strict allow-list.
+
+    Enforces ``^[A-Za-z0-9._/-]{1,200}$``, rejects a leading ``-`` (which git
+    would treat as an option) and rejects any ``..`` substring. Returns the name
+    unchanged on success; raises ``ValueError`` (naming the field and echoing the
+    rejected ticket value, which is not a secret) on any violation.
+    """
+    if name is None or not _BRANCH_RE.match(name):
+        raise ValueError(
+            f"invalid {field}: {name!r} does not match ^[A-Za-z0-9._/-]{{1,200}}$"
+        )
+    if name.startswith("-"):
+        raise ValueError(f"invalid {field}: {name!r} must not start with '-'")
+    if ".." in name:
+        raise ValueError(f"invalid {field}: {name!r} must not contain '..'")
+    return name
+
+
+def validate_clone_url(url: str, field: str = "repo_clone_url") -> str:
+    """Validate a GitHub HTTPS clone URL.
+
+    Accepts ONLY ``https://github.com/<owner>/<repo>`` or the same with a single
+    trailing ``.git``. Rejects any other scheme, host, userinfo, port, query,
+    fragment, or extra path segments. Returns the URL unchanged on success;
+    raises ``ValueError`` on any violation.
+    """
+    if url is None or not _CLONE_URL_RE.match(url):
+        raise ValueError(
+            f"invalid {field}: {url!r} is not a https://github.com/<owner>/<repo>"
+            " clone URL"
+        )
+    return url
 
 
 def parse_description_header(description: str) -> dict:
@@ -69,10 +127,24 @@ def parse_description_header(description: str) -> dict:
             "(repo_clone_url); rejecting ticket"
         )
 
+    # Strict validation (issue #4). repo_clone_url is required; base_branch
+    # defaults to 'main' and is always validated; fix_branch is optional but is
+    # validated when present. file_to_fix is not interpolated into a shell
+    # command (it is only embedded in the kiro-cli brief argv), so it keeps its
+    # existing pass-through behavior.
+    validate_clone_url(repo_clone_url)
+
+    base_branch = parsed.get("base_branch", "main")
+    validate_branch_name(base_branch, field="base_branch")
+
+    fix_branch = parsed.get("fix_branch")
+    if fix_branch is not None:
+        validate_branch_name(fix_branch, field="fix_branch")
+
     return {
         "repo_clone_url": repo_clone_url,
-        "base_branch": parsed.get("base_branch", "main"),
-        "fix_branch": parsed.get("fix_branch"),
+        "base_branch": base_branch,
+        "fix_branch": fix_branch,
         "file_to_fix": parsed.get("file_to_fix"),
     }
 

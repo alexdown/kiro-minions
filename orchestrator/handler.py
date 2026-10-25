@@ -6,8 +6,12 @@ Flow:
     -> parse description Part 1 header + sonar_hash label
     -> idempotency check / claim via DynamoDB (key = sonar_hash)
     -> build TicketPayload
-    -> invoke AgentCore Runtime with payload (JSON, not a rendered prompt)
-    -> 200 / 400 / 500
+    -> enqueue TicketPayload (JSON) onto SQS and return 202 immediately
+    -> 202 / 400 / 500
+
+A separate SQS-triggered Lambda (``sqs_consumer`` below) drains the queue and
+invokes the AgentCore Runtime with the payload (JSON, not a rendered prompt).
+The runtime writes the terminal job status back to DynamoDB itself.
 """
 
 from __future__ import annotations
@@ -31,16 +35,61 @@ JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "kiro-minions-jobs")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
-# Job-state values stored in DynamoDB.
+# SQS queue the webhook producer enqueues TicketPayloads onto (FEAT-004 #7).
+# The SQS-triggered consumer Lambda (sqs_consumer) drains it and invokes the
+# AgentCore Runtime, so the webhook returns 202 without blocking on the invoke.
+SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
+
+# How long a claimed (in_flight) job's lease is valid, in seconds. After it
+# expires a stale in_flight row becomes claimable again so a crashed/timed-out
+# consumer cannot wedge a sonar_hash forever (FEAT-004 #6).
+LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "3600"))
+
+# Environment variables whose VALUES must never appear in a response body or log
+# line. These are usually NOT present in the orchestrator's environment, so this
+# is defence in depth (the runtime is the primary secret holder). redact() reads
+# them from os.environ at call time rather than caching at import.
+_SECRET_ENV_VARS = ("GITHUB_TOKEN", "KIRO_API_KEY")
+REDACTION_MASK = "***REDACTED***"
+
+
+def redact(text):  # noqa: ANN001 - accepts str | None
+    """Mask secret env values (GITHUB_TOKEN, KIRO_API_KEY) in a string.
+
+    Skips empty/unset env values (never masks the empty string) and returns
+    ``None`` unchanged so optional error strings pass through safely.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name, "")
+        if value:
+            text = text.replace(value, REDACTION_MASK)
+    return text
+
+# Job-state values stored in DynamoDB. These string values MUST stay in sync
+# with the terminal statuses the runtime writes (runtime/agent.py: STATUS_DONE /
+# STATUS_FAILED / STATUS_TESTS_FAILED), otherwise a status the runtime writes
+# can become unrecognised here and wedge the sonar_hash.
 STATUS_IN_FLIGHT = "in_flight"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
+# The runtime writes this when kiro produced no change / the tests never passed.
+# It is a non-success terminal state, but a later webhook must still be able to
+# re-dispatch it (e.g. after the ticket is adjusted), so it is RETRYABLE: only
+# a successful ``done`` permanently blocks re-dispatch.
+STATUS_TESTS_FAILED = "tests_failed"
 
-# Statuses that block a re-dispatch (idempotency).
+# Statuses that block a re-dispatch (idempotency). Only a successful terminal
+# ``done`` (and a live in_flight lease) blocks; ``failed`` and ``tests_failed``
+# are retryable.
 _BLOCKING_STATUSES = {STATUS_IN_FLIGHT, STATUS_DONE}
 
 _dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 _agentcore = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
+_sqs = boto3.client("sqs", region_name=AWS_REGION)
 
 
 def _response(status_code: int, body: dict) -> dict:
@@ -92,23 +141,42 @@ def _claim_job(sonar_hash: str, ticket_id: str) -> bool:
     """
     table = _dynamodb.Table(DYNAMODB_TABLE)
     now = int(time.time())
+    lease_expires_at = now + LEASE_SECONDS
     item = {
         "sonar_hash": sonar_hash,
         "ticket_id": ticket_id,
         "status": STATUS_IN_FLIGHT,
         "created_at": now,
         "updated_at": now,
+        "lease_expires_at": lease_expires_at,
     }
-    # Condition: item does not exist, OR its status is "failed" (retry allowed).
+    # A claim succeeds when one of these holds:
+    #   * the item does not exist yet,
+    #   * its status is "failed" (a previous run failed -> retry allowed),
+    #   * its status is "tests_failed" (the runtime produced no change / the
+    #     tests never passed -> a later webhook may re-dispatch after the ticket
+    #     is adjusted; this is a non-success terminal state, not a dead end), or
+    #   * its status is "in_flight" AND its lease has expired (#l < :now) -> the
+    #     previous consumer crashed/timed out, so the stale lease is reclaimable.
+    # A "done" row has no matching clause, so it alone keeps blocking
+    # re-dispatch: only a successful terminal PR permanently wedges the hash.
     cond = (
-        "attribute_not_exists(sonar_hash) OR #s = :failed"
+        "attribute_not_exists(sonar_hash)"
+        " OR #s = :failed"
+        " OR #s = :tests_failed"
+        " OR (#s = :in_flight AND #l < :now)"
     )
     try:
         table.put_item(
             Item=item,
             ConditionExpression=cond,
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":failed": STATUS_FAILED},
+            ExpressionAttributeNames={"#s": "status", "#l": "lease_expires_at"},
+            ExpressionAttributeValues={
+                ":failed": STATUS_FAILED,
+                ":tests_failed": STATUS_TESTS_FAILED,
+                ":in_flight": STATUS_IN_FLIGHT,
+                ":now": now,
+            },
         )
         return True
     except ClientError as exc:
@@ -208,13 +276,54 @@ def _invoke_runtime(payload: dict) -> str:
     return "".join(chunks)
 
 
+def _enqueue_payload(payload: dict) -> None:
+    """Send the TicketPayload JSON to the SQS work queue.
+
+    The SQS-triggered consumer Lambda (``sqs_consumer``) later drains the queue
+    and performs the blocking AgentCore invoke, so the webhook can return 202
+    immediately (#7). Raises if SQS_QUEUE_URL is unset or send_message fails.
+    """
+    if not SQS_QUEUE_URL:
+        raise RuntimeError("SQS_QUEUE_URL env var is not set")
+    _sqs.send_message(
+        QueueUrl=SQS_QUEUE_URL,
+        MessageBody=json.dumps(payload),
+    )
+
+
+def sqs_consumer(event, context):  # noqa: ANN001 - Lambda signature
+    """SQS-triggered Lambda: drain the queue and invoke the AgentCore Runtime.
+
+    Each record body is a TicketPayload JSON produced by ``handler`` /
+    ``_enqueue_payload``. For every record we call ``_invoke_runtime(payload)``,
+    which performs the (blocking) AgentCore invoke. On failure we RE-RAISE so
+    SQS retries the message and, after the configured attempts, routes it to the
+    DLQ. We do NOT record job status here: the runtime writes the terminal
+    status to DynamoDB itself (#6), so the consumer stays thin.
+    """
+    records = (event or {}).get("Records") or []
+    for record in records:
+        body = record.get("body")
+        payload = json.loads(body) if isinstance(body, str) else body
+        sonar_hash = (payload or {}).get("sonar_hash")
+        try:
+            _invoke_runtime(payload)
+        except Exception as exc:  # noqa: BLE001 - re-raise after logging redacted
+            # Let SQS retry / DLQ. Never let a secret reach the log line.
+            print(redact(
+                f"runtime invocation failed for sonar_hash={sonar_hash}: {exc}"
+            ))
+            raise
+    return {"status": "ok", "processed": len(records)}
+
+
 def handler(event, context):  # noqa: ANN001 - Lambda signature
     """Lambda entry point."""
     # --- Parse incoming webhook body ---
     try:
         body = _extract_body(event)
     except (ValueError, json.JSONDecodeError) as exc:
-        return _response(400, {"error": f"invalid request body: {exc}"})
+        return _response(400, {"error": redact(f"invalid request body: {exc}")})
 
     issue = body.get("issue") or {}
     fields = issue.get("fields") or {}
@@ -239,13 +348,13 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     try:
         header = parse_description_header(description)
     except ValueError as exc:
-        return _response(400, {"error": str(exc)})
+        return _response(400, {"error": redact(str(exc))})
 
     # --- Idempotency claim ---
     try:
         claimed = _claim_job(sonar_hash, ticket_id)
     except ClientError as exc:
-        return _response(500, {"error": f"dynamodb error: {exc}"})
+        return _response(500, {"error": redact(f"dynamodb error: {exc}")})
 
     if not claimed:
         return _response(
@@ -257,21 +366,28 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
             },
         )
 
-    # --- Build payload and dispatch to the Runtime ---
+    # --- Build payload and enqueue for the consumer (#7) ---
     payload = _build_payload(ticket_id, summary, description, header, sonar_hash)
 
     try:
-        result = _invoke_runtime(payload)
-    except Exception as exc:  # noqa: BLE001 - report any dispatch failure
-        _mark_status(sonar_hash, STATUS_FAILED, {"error": str(exc)})
-        return _response(500, {"error": f"runtime invocation failed: {exc}"})
+        _enqueue_payload(payload)
+    except Exception as exc:  # noqa: BLE001 - report any enqueue failure
+        # Enqueue failed before any work started: release the claim by marking
+        # the job failed so a later webhook can retry, then report a redacted
+        # 500. The reason string is redacted and carries no runtime output.
+        _mark_status(sonar_hash, STATUS_FAILED, {"error": redact(str(exc))})
+        return _response(
+            500, {"error": redact(f"enqueue failed: {exc}")}
+        )
 
+    # The webhook returns 202 the moment the payload is enqueued. It carries no
+    # runtime output and no secret — the terminal job result is surfaced via the
+    # DynamoDB job status the runtime writes itself, not the HTTP body.
     return _response(
-        200,
+        202,
         {
-            "status": "dispatched",
+            "status": "accepted",
             "sonar_hash": sonar_hash,
             "ticket_id": ticket_id,
-            "runtime_response": result,
         },
     )

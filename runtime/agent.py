@@ -14,13 +14,17 @@ Runs as an AgentCore Runtime container. Exposes /invocations (POST) and
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
+import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
 # ---------------------------------------------------------------------------
@@ -28,8 +32,23 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 # ---------------------------------------------------------------------------
 
 MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-KIRO_API_KEY = os.environ.get("KIRO_API_KEY", "")  # kiro-cli reads this directly
+
+# DynamoDB job table the runtime writes its terminal status to (#6). The
+# orchestrator owns the same table; the runtime needs its own boto3 handle
+# because it runs in a separate container. AWS_REGION is injected by the
+# Runtime environment.
+DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "kiro-minions-jobs")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# Terminal job statuses the runtime writes back.
+STATUS_DONE = "done"
+STATUS_FAILED = "failed"
+STATUS_TESTS_FAILED = "tests_failed"
+
+# Names of the environment variables whose VALUES must never leak into argv,
+# logs, exceptions, or responses. redact() reads them from os.environ at call
+# time (not cached) so tests can monkeypatch the environment without a reload.
+_SECRET_ENV_VARS = ("GITHUB_TOKEN", "KIRO_API_KEY")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +57,132 @@ logging.basicConfig(
 log = logging.getLogger("kiro-minions-agent")
 
 app = BedrockAgentCoreApp()
+
+# Module-level DynamoDB resource. Under the test stubs this resolves to the
+# in-memory fake; in production it is the real boto3 resource. Tests monkeypatch
+# ``_dynamodb`` (or point it at a FakeDynamoResource) to inspect writes.
+_dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+
+
+# ---------------------------------------------------------------------------
+# Validation (issue #4: shell-injection defence in depth)
+#
+# These patterns DUPLICATE orchestrator/parser.py on purpose: this module runs
+# in a separate AgentCore Runtime container and cannot import the orchestrator
+# package. Re-validating here means a crafted payload that somehow bypassed the
+# orchestrator still cannot reach a shell command.
+# ---------------------------------------------------------------------------
+
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
+_CLONE_URL_RE = re.compile(
+    r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\.git)?$"
+)
+
+
+def _validate_branch_name(name: str, field: str = "branch") -> str:
+    """Validate a branch name; raise ValueError on any violation."""
+    if name is None or not _BRANCH_RE.match(name):
+        raise ValueError(
+            f"invalid {field}: {name!r} does not match ^[A-Za-z0-9._/-]{{1,200}}$"
+        )
+    if name.startswith("-"):
+        raise ValueError(f"invalid {field}: {name!r} must not start with '-'")
+    if ".." in name:
+        raise ValueError(f"invalid {field}: {name!r} must not contain '..'")
+    return name
+
+
+def _validate_clone_url(url: str, field: str = "repo_clone_url") -> str:
+    """Validate a GitHub HTTPS clone URL; raise ValueError on any violation."""
+    if url is None or not _CLONE_URL_RE.match(url):
+        raise ValueError(
+            f"invalid {field}: {url!r} is not a https://github.com/<owner>/<repo>"
+            " clone URL"
+        )
+    return url
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction (issue #3)
+# ---------------------------------------------------------------------------
+
+REDACTION_MASK = "***REDACTED***"
+
+
+def redact(text: str | None) -> str | None:
+    """Mask secret values (GITHUB_TOKEN, KIRO_API_KEY) wherever they appear.
+
+    Reads the secret values from ``os.environ`` at call time so the result is
+    never cached at import and tests can set/unset the env freely. Empty or
+    unset env values are skipped (we never mask an empty string). ``None`` input
+    is returned unchanged so callers can pass through optional values safely.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name, "")
+        if value:  # skip empty/unset: never mask the empty string
+            text = text.replace(value, REDACTION_MASK)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Git authentication (issue #3: no token in argv)
+# ---------------------------------------------------------------------------
+
+
+def setup_git_auth() -> None:
+    """Configure git to authenticate via gh, without the token in any argv.
+
+    When GITHUB_TOKEN is set, ``gh auth setup-git`` registers gh as git's
+    credential helper. gh reads the token from the GITHUB_TOKEN/GH_TOKEN
+    environment variable itself, so the token value is never passed as a
+    command-line argument (and never logged, since redact() masks it anyway).
+    """
+    if not os.environ.get("GITHUB_TOKEN"):
+        log.info("GITHUB_TOKEN not set — skipping gh auth setup-git.")
+        return
+    _run(["gh", "auth", "setup-git"])
+
+
+# ---------------------------------------------------------------------------
+# Terminal job status (issue #6: runtime writes its own lifecycle result)
+# ---------------------------------------------------------------------------
+
+
+def write_job_status(sonar_hash: str, status: str,
+                     extra: dict | None = None) -> None:
+    """Write the terminal job status to DynamoDB, keyed by sonar_hash.
+
+    ``status`` is one of ``done`` / ``failed`` / ``tests_failed``. ``extra``
+    carries additional attributes (e.g. ``pr_url`` on success or a REDACTED
+    ``reason`` on failure). This is best-effort: a write failure is logged
+    (redacted) and swallowed so it can never mask or replace the real pipeline
+    result. Nothing written here embeds a secret — callers must redact any
+    free-text ``reason`` before passing it in.
+    """
+    if not sonar_hash:
+        log.warning("write_job_status: missing sonar_hash — skipping status write.")
+        return
+    try:
+        table = _dynamodb.Table(DYNAMODB_TABLE)
+        expr_names = {"#s": "status", "#u": "updated_at"}
+        expr_values = {":s": status, ":u": int(time.time())}
+        set_parts = ["#s = :s", "#u = :u"]
+        for i, (k, v) in enumerate((extra or {}).items()):
+            expr_names[f"#e{i}"] = k
+            expr_values[f":e{i}"] = v
+            set_parts.append(f"#e{i} = :e{i}")
+        table.update_item(
+            Key={"sonar_hash": sonar_hash},
+            UpdateExpression="SET " + ", ".join(set_parts),
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
+        )
+    except Exception as exc:  # noqa: BLE001 - never raise out of a status write
+        log.warning("write_job_status failed: %s", redact(str(exc)))
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +193,15 @@ app = BedrockAgentCoreApp()
 def _default_runner(cmd: str | list[str], cwd: str | Path | None = None,
                     check: bool = True,
                     timeout: int = 600) -> subprocess.CompletedProcess:
-    """Real subprocess-backed runner. Run a shell command, log it, return result."""
+    """Real subprocess-backed runner. Run a command, log it, and return the result.
+
+    A list ``cmd`` runs with ``shell=False`` (the only safe form for any
+    ticket-derived command, issue #4); a str ``cmd`` runs with ``shell=True``
+    and is used ONLY for the auto-detected test command, which never contains
+    ticket data. All displayed/logged text (the command line, STDOUT, STDERR)
+    and the RuntimeError raised on non-zero exit are passed through redact() so
+    secret values can never leak into logs or exception messages (issue #3).
+    """
     if isinstance(cmd, str):
         shell = True
         display = cmd
@@ -56,25 +209,30 @@ def _default_runner(cmd: str | list[str], cwd: str | Path | None = None,
         shell = False
         display = " ".join(cmd)
 
-    log.info("RUN: %s (cwd=%s)", display, cwd or ".")
+    log.info("RUN: %s (cwd=%s)", redact(display), cwd or ".")
     result = subprocess.run(
         cmd, shell=shell, cwd=cwd, capture_output=True, text=True, timeout=timeout,
     )
     if result.stdout:
-        log.info("STDOUT:\n%s", result.stdout[-2000:])
+        log.info("STDOUT:\n%s", redact(result.stdout[-2000:]))
     if result.stderr:
-        log.info("STDERR:\n%s", result.stderr[-2000:])
+        log.info("STDERR:\n%s", redact(result.stderr[-2000:]))
     if check and result.returncode != 0:
-        raise RuntimeError(
+        raise RuntimeError(redact(
             f"Command failed (rc={result.returncode}): {display}\n"
             f"stderr: {result.stderr[-500:]}"
-        )
+        ))
     return result
 
 
 # Single injectable indirection: tests can replace `RUNNER` (e.g. with a
 # FakeRunner) so no real subprocess is spawned. All call sites go through
 # `_run`, which delegates to whatever `RUNNER` currently points at.
+#
+# NOTE: there is deliberately NO _auth_clone_url helper. The token must never
+# be injected into the clone URL (issue #3); git authenticates via the gh
+# credential helper configured in setup_git_auth(), which reads GITHUB_TOKEN
+# from the environment and keeps it out of argv and out of any logged URL.
 RUNNER = _default_runner
 
 
@@ -82,16 +240,6 @@ def _run(cmd: str | list[str], cwd: str | Path | None = None, check: bool = True
          timeout: int = 600) -> subprocess.CompletedProcess:
     """Run a command through the injectable RUNNER and return the result."""
     return RUNNER(cmd, cwd=cwd, check=check, timeout=timeout)
-
-
-def _auth_clone_url(clone_url: str) -> str:
-    """Inject GITHUB_TOKEN into the clone URL for authentication."""
-    if not GITHUB_TOKEN:
-        return clone_url
-    # https://github.com/org/repo.git → https://x-token:<token>@github.com/org/repo.git
-    if clone_url.startswith("https://"):
-        return clone_url.replace("https://", f"https://x-token:{GITHUB_TOKEN}@", 1)
-    return clone_url
 
 
 def _detect_test_command(repo_dir: Path) -> str | None:
@@ -124,20 +272,31 @@ def _detect_test_command(repo_dir: Path) -> str | None:
 
 
 def step_clone(clone_url: str, base_branch: str, workdir: Path) -> Path:
-    """Clone the repo and checkout the base branch."""
-    auth_url = _auth_clone_url(clone_url)
+    """Clone the repo and checkout the base branch.
+
+    The plain validated https URL is used directly — no token is injected into
+    the URL (issue #3). Authentication is handled by git's gh credential helper
+    configured in setup_git_auth().
+    """
     repo_name = clone_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
     repo_dir = workdir / repo_name
 
-    _run(f"git clone --branch {base_branch} --single-branch {auth_url} {repo_dir}")
-    _run("git config user.email 'kiro-minions[bot]@users.noreply.github.com'", cwd=repo_dir)
-    _run("git config user.name 'kiro-minions[bot]'", cwd=repo_dir)
+    _run([
+        "git", "clone", "--branch", base_branch, "--single-branch",
+        clone_url, str(repo_dir),
+    ])
+    _run(
+        ["git", "config", "user.email",
+         "kiro-minions[bot]@users.noreply.github.com"],
+        cwd=repo_dir,
+    )
+    _run(["git", "config", "user.name", "kiro-minions[bot]"], cwd=repo_dir)
     return repo_dir
 
 
 def step_create_branch(repo_dir: Path, fix_branch: str) -> None:
     """Create and checkout the fix branch."""
-    _run(f"git checkout -b {fix_branch}", cwd=repo_dir)
+    _run(["git", "checkout", "-b", fix_branch], cwd=repo_dir)
 
 
 def step_kiro_fix(repo_dir: Path, description: str, file_to_fix: str | None,
@@ -183,10 +342,10 @@ def step_run_tests(repo_dir: Path) -> tuple[bool, str]:
 
 def step_commit(repo_dir: Path, summary: str, ticket_id: str, sonar_hash: str) -> bool:
     """Stage all changes and commit. Returns True if there were changes to commit."""
-    _run("git add -A", cwd=repo_dir)
+    _run(["git", "add", "-A"], cwd=repo_dir)
 
     # Check if there's anything to commit
-    result = _run("git diff --cached --quiet", cwd=repo_dir, check=False)
+    result = _run(["git", "diff", "--cached", "--quiet"], cwd=repo_dir, check=False)
     if result.returncode == 0:
         log.warning("No changes to commit — kiro-cli produced no diff.")
         return False
@@ -198,7 +357,7 @@ def step_commit(repo_dir: Path, summary: str, ticket_id: str, sonar_hash: str) -
 
 def step_push(repo_dir: Path, fix_branch: str) -> None:
     """Push the fix branch to origin."""
-    _run(f"git push origin {fix_branch}", cwd=repo_dir)
+    _run(["git", "push", "origin", fix_branch], cwd=repo_dir)
 
 
 def step_open_pr(repo_dir: Path, base_branch: str, fix_branch: str,
@@ -245,8 +404,19 @@ def run_pipeline(payload: dict) -> dict:
     ticket_url = payload.get("ticket_url", "")
     sonar_hash = payload["sonar_hash"]
 
+    # Defence in depth (issue #4): re-validate the ticket-derived values that
+    # flow into git commands BEFORE running any shell command. A ValueError here
+    # fails the pipeline safely before clone/branch/push happen.
+    _validate_clone_url(repo_clone_url)
+    _validate_branch_name(base_branch, field="base_branch")
+    _validate_branch_name(fix_branch, field="fix_branch")
+
     with tempfile.TemporaryDirectory(prefix="kiro-minions-") as workdir:
         workdir = Path(workdir)
+
+        # 0. Configure git auth via gh (token stays in the env, never in argv).
+        log.info("=== STEP 0: Configure git auth ===")
+        setup_git_auth()
 
         # 1. Clone
         log.info("=== STEP 1: Clone ===")
@@ -275,8 +445,8 @@ def run_pipeline(payload: dict) -> dict:
 
             # Reset changes before retrying so kiro starts fresh
             if attempt < MAX_FIX_ATTEMPTS:
-                _run("git checkout -- .", cwd=repo_dir)
-                _run("git clean -fd", cwd=repo_dir)
+                _run(["git", "checkout", "--", "."], cwd=repo_dir)
+                _run(["git", "clean", "-fd"], cwd=repo_dir)
 
         # 5. Commit
         log.info("=== STEP 5: Commit ===")
@@ -322,17 +492,42 @@ async def entrypoint(payload: dict):
     log.info("Received payload: ticket_id=%s sonar_hash=%s",
              payload.get("ticket_id"), payload.get("sonar_hash"))
 
-    yield {"event": {"text": f"Starting fix for {payload.get('ticket_id', 'unknown')}...\n"}}
+    sonar_hash = payload.get("sonar_hash")
+
+    yield {"event": {"text": redact(
+        f"Starting fix for {payload.get('ticket_id', 'unknown')}...\n"
+    )}}
 
     try:
-        result = run_pipeline(payload)
+        # #14: run the blocking pipeline off the event loop so /ping health
+        # checks stay responsive for the duration of a long fix.
+        result = await asyncio.to_thread(run_pipeline, payload)
     except Exception as exc:
         log.exception("Pipeline failed")
-        result = {"status": "failed", "reason": str(exc)}
+        # str(exc) can echo command output/stderr; redact before it leaves here.
+        reason = redact(str(exc))
+        result = {"status": "failed", "reason": reason}
+        # #6: an unexpected exception is a hard failure.
+        write_job_status(sonar_hash, STATUS_FAILED, {"reason": reason})
+    else:
+        # #6: translate the pipeline result into a terminal DynamoDB status.
+        #   success                 -> done + pr_url
+        #   no-change / tests never  -> tests_failed + redacted reason
+        #     passed (status=failed)
+        if result.get("status") == "success":
+            write_job_status(
+                sonar_hash, STATUS_DONE,
+                {"pr_url": result.get("pr_url", "")},
+            )
+        else:
+            write_job_status(
+                sonar_hash, STATUS_TESTS_FAILED,
+                {"reason": redact(str(result.get("reason", "")))},
+            )
 
-    yield {"event": {"text": json.dumps(result, indent=2)}}
+    yield {"event": {"text": redact(json.dumps(result, indent=2))}}
 
-    log.info("Pipeline result: %s", json.dumps(result))
+    log.info("Pipeline result: %s", redact(json.dumps(result)))
 
 
 # ---------------------------------------------------------------------------
