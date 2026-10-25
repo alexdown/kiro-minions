@@ -183,3 +183,70 @@ def test_no_diff_path(fixed_workdir):
     # No push or PR happened.
     assert runner.find("git push") is None
     assert runner.find("gh pr create") is None
+
+
+def test_no_diff_path_reports_actual_attempt_count(fixed_workdir):
+    """#15 regression guard: the no-diff/no-changes result must report the REAL
+    kiro attempt count, NOT MAX_FIX_ATTEMPTS.
+
+    Here the repo has a test runner (tests/ marker) and tests pass on the first
+    kiro attempt (default pytest rc=0), so the fix loop breaks on attempt 1.
+    kiro therefore ran exactly ONCE. If the code regressed to reporting
+    ``MAX_FIX_ATTEMPTS`` (3) at the no-diff return site, this assertion would
+    fail. We also assert kiro was invoked exactly once so the count is anchored
+    to the real number of attempts, not the loop bound.
+    """
+    runner = FakeRunner(
+        results=[ScriptedResult(returncode=0, match="git diff --cached --quiet")]
+    )
+    agent.RUNNER = runner
+
+    result = agent.run_pipeline(_payload())
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "kiro-cli produced no changes"
+    # kiro-cli actually ran exactly once (tests passed on attempt 1).
+    assert runner.count("kiro-cli chat") == 1
+    # The reported attempts equals that real count, NOT MAX_FIX_ATTEMPTS.
+    assert result["attempts"] == 1
+    assert result["attempts"] < agent.MAX_FIX_ATTEMPTS
+
+
+def test_no_diff_after_retries_reports_real_count_not_max(fixed_workdir):
+    """#15 regression guard, multi-attempt variant: when the fix loop runs more
+    than once (a distinct failure then a pass) but ultimately produces no diff,
+    the reported ``attempts`` must equal the number of kiro runs (2), not
+    ``MAX_FIX_ATTEMPTS``.
+
+    Sequence of pytest matchers:
+      1) baseline run  -> rc=1 (red before the fix)
+      2) attempt 1 run -> rc=1 (distinct failure -> retry, no early stop)
+      3) attempt 2 run -> rc=0 (green -> break)
+    Then ``git diff --cached --quiet`` returns rc=0 (no staged changes) so the
+    pipeline takes the no-changes failure return, which must report attempts==2.
+    """
+    runner = FakeRunner(
+        results=[
+            ScriptedResult(returncode=1, stdout="baseline failed", match="pytest"),
+            ScriptedResult(returncode=1, stdout="FAILED tests/test_x.py::test_a",
+                           match="pytest"),
+            ScriptedResult(returncode=0, stdout="all passed", match="pytest"),
+            # Post-clone / post-install / post-fix porcelain snapshots.
+            ScriptedResult(stdout="", match="git status --porcelain"),
+            ScriptedResult(stdout="", match="git status --porcelain"),
+            ScriptedResult(stdout="", match="git status --porcelain"),
+            # rc=0 -> nothing staged -> no-changes failure return.
+            ScriptedResult(returncode=0, match="git diff --cached --quiet"),
+        ]
+    )
+    agent.RUNNER = runner
+
+    result = agent.run_pipeline(_payload())
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "kiro-cli produced no changes"
+    # kiro ran twice (attempt 1 failed, attempt 2 passed) before the no-diff.
+    assert runner.count("kiro-cli chat") == 2
+    # The real attempt count is reported, strictly below MAX_FIX_ATTEMPTS (3).
+    assert result["attempts"] == 2
+    assert result["attempts"] < agent.MAX_FIX_ATTEMPTS
