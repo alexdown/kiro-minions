@@ -72,15 +72,23 @@ def test_valid_payload_uses_argv_lists_except_test_command(monkeypatch, tmp_path
     """Every recorded command is an argv list except the detected test command."""
     runner = RecordingRunner()
     # Queue results in call order so the pipeline reaches PR creation:
-    #  clone, config, config, checkout, kiro-cli, pytest(pass),
-    #  add, diff(--quiet rc=1 => changes exist), commit, push, gh pr create.
+    #  clone, config, config, checkout, status(post-clone), status(post-install),
+    #  baseline pytest, kiro-cli, pytest(pass), status(post-fix), git add --,
+    #  diff(--quiet rc=1 => changes exist), commit, push, gh pr create.
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # clone
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # config email
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # config name
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # checkout -b
+    runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout=""))  # status post-clone
+    # Dependency install is skipped (detection returns None for the empty tree).
+    runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout=""))  # status post-install
+    # A BASELINE pytest run (#9) happens before the first kiro-cli fix.
+    runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout="ok"))  # baseline pytest
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # kiro-cli
     runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout="ok"))  # pytest
-    runner.queue_result(FakeCompletedProcess(None, returncode=0))  # git add -A
+    # Scoped staging (#13): post-fix status reports one kiro-changed file.
+    runner.queue_result(FakeCompletedProcess(None, returncode=0, stdout=" M server.js\n"))  # status post-fix
+    runner.queue_result(FakeCompletedProcess(None, returncode=0))  # git add -- server.js
     runner.queue_result(FakeCompletedProcess(None, returncode=1))  # diff: changes
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # commit
     runner.queue_result(FakeCompletedProcess(None, returncode=0))  # push
@@ -91,8 +99,10 @@ def test_valid_payload_uses_argv_lists_except_test_command(monkeypatch, tmp_path
     monkeypatch.setattr(agent.subprocess, "run", runner)
 
     # The detected test command is the ONLY allowed shell string. Make detection
-    # deterministic and independent of a real cloned tree.
+    # deterministic and independent of a real cloned tree. Also stub the install
+    # detector so no ecosystem install argv is injected for this assertion.
     monkeypatch.setattr(agent, "_detect_test_command", lambda repo_dir: "pytest")
+    monkeypatch.setattr(agent, "_detect_install_command", lambda repo_dir: None)
 
     result = agent.run_pipeline(_payload())
 
@@ -112,9 +122,11 @@ def test_valid_payload_uses_argv_lists_except_test_command(monkeypatch, tmp_path
             assert isinstance(args, list)
             assert call["shell"] is False
 
-    # Exactly one shell-string invocation: the single detected test command.
-    assert len(shell_string_calls) == 1, (
-        f"expected exactly one shell-string call, got {shell_string_calls}"
+    # Two shell-string invocations now: the baseline test run (#9) and the
+    # post-fix test run. Both are the single detected test command (no ticket
+    # data); everything else remains an argv list.
+    assert len(shell_string_calls) == 2, (
+        f"expected two shell-string calls (baseline + post-fix), got {shell_string_calls}"
     )
 
     # The git clone invocation is an argv list with the validated branch/url.

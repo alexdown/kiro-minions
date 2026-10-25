@@ -77,6 +77,16 @@ def test_happy_path(fixed_workdir):
     pr_url = "https://github.com/your-org/your-repo/pull/42"
     runner = FakeRunner(
         results=[
+            # Scoped staging (#13) takes three `git status --porcelain` snapshots
+            # (post-clone, post-install, post-fix), consumed in order. The first
+            # two are clean; the post-fix one reports one kiro-changed file plus
+            # a cache artifact that must be excluded.
+            ScriptedResult(stdout="", match="git status --porcelain"),
+            ScriptedResult(stdout="", match="git status --porcelain"),
+            ScriptedResult(
+                stdout=" M server.js\n?? __pycache__/x.pyc\n",
+                match="git status --porcelain",
+            ),
             # rc=1 means `git diff --cached --quiet` sees staged changes.
             ScriptedResult(returncode=1, match="git diff --cached --quiet"),
             ScriptedResult(stdout=pr_url, match="gh pr create"),
@@ -90,12 +100,20 @@ def test_happy_path(fixed_workdir):
     assert result["pr_url"] == pr_url
     assert result["attempts"] == 1
     assert result["tests_passed"] is True
+    # Only the kiro-changed source file is staged; the cache artifact is excluded.
+    assert result["staged_files"] == ["server.js"]
 
     cmds = runner.commands
     # Expected ordered sequence of key commands.
     assert any(c.startswith("git clone --branch master --single-branch") for c in cmds)
     assert "git checkout -b sonarqube-fix/xss-swig-autoescape" in cmds
-    assert "git add -A" in cmds
+    # Scoped staging replaced the old blanket `git add -A` (#13).
+    assert "git add -A" not in cmds
+    assert "git status --porcelain" in cmds
+    # The surviving path is staged via `git add -- <path>` (not the excluded one).
+    add = runner.find("git add --")
+    assert add is not None
+    assert add.cmd == ["git", "add", "--", "server.js"]
     assert "git diff --cached --quiet" in cmds
     assert "git push origin sonarqube-fix/xss-swig-autoescape" in cmds
 
@@ -115,11 +133,21 @@ def test_happy_path(fixed_workdir):
 
 
 def test_retry_then_pass(fixed_workdir):
-    # First pytest run fails (rc=1), second passes (rc=0).
+    # Ordered pytest matchers are consumed in sequence (#9 adds a baseline run):
+    #   1) baseline run  -> rc=1 (red before the fix)
+    #   2) attempt 1 run  -> rc=1 (still failing, triggers a retry)
+    #   3) attempt 2 run  -> rc=0 (green, break)
     runner = FakeRunner(
         results=[
+            ScriptedResult(returncode=1, stdout="baseline failed", match="pytest"),
             ScriptedResult(returncode=1, stdout="1 failed", match="pytest"),
             ScriptedResult(returncode=0, stdout="all passed", match="pytest"),
+            # Scoped staging (#13) takes three `git status --porcelain` snapshots
+            # (post-clone, post-install, post-fix), consumed in order: the first
+            # two are clean, the post-fix one reports one kiro-changed file.
+            ScriptedResult(stdout="", match="git status --porcelain"),
+            ScriptedResult(stdout="", match="git status --porcelain"),
+            ScriptedResult(stdout=" M server.js\n", match="git status --porcelain"),
             # rc=1 means `git diff --cached --quiet` sees staged changes.
             ScriptedResult(returncode=1, match="git diff --cached --quiet"),
             ScriptedResult(stdout="https://github.com/o/r/pull/7", match="gh pr create"),
@@ -131,6 +159,8 @@ def test_retry_then_pass(fixed_workdir):
 
     assert result["status"] == "success"
     assert result["attempts"] == 2
+    # Baseline was red (failing before the fix).
+    assert result["baseline"]["passed"] is False
 
     # Reset commands issued between the failed attempt and the retry.
     assert "git checkout -- ." in runner.commands
