@@ -256,3 +256,5 @@ reclaim gate, independent of when the TTL sweeper runs.
 - [specs/overview.md](specs/overview.md) — architecture and design rationale
 - [specs/payload.md](specs/payload.md) — payload schema + ticket parsing
 - [specs/runtime.md](specs/runtime.md) — Runtime container design and deployment
+- [specs/ide-ingress.md](specs/ide-ingress.md) — **DRAFT** proposal: Kiro IDE task ingress (remote worker hand-off)
+- [specs/adr/README.md](specs/adr/README.md) — Architecture Decision Registry (decisions pending review)
