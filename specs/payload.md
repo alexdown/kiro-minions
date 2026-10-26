@@ -74,14 +74,16 @@ The orchestrator finds the label starting with `sonar-hash:` and takes the value
 
 `sonar_hash` is the natural idempotency key — one finding, one hash, one PR.
 
-Before invoking the Runtime, the orchestrator atomically claims the `sonar_hash` in DynamoDB:
+Before enqueueing, the producer Lambda atomically claims the `sonar_hash` in DynamoDB (writing `status=in_flight` with a numeric `lease_expires_at = now + LEASE_SECONDS`):
 
-- If a record exists with status `in_flight` or `done` → **skip** (no duplicate PRs).
-- If no record exists, or status is `failed` → **claim and dispatch** (allows retry).
+- If a record exists with status `done`, or `in_flight` **with a live lease** → **skip** (no duplicate PRs).
+- If no record exists, or status is `failed` / `tests_failed`, or `in_flight` **with an expired lease** → **claim and dispatch** (allows retry; a crashed or timed-out consumer cannot wedge a hash forever).
+
+The claimed payload is enqueued on the SQS `JobsQueue`; a consumer Lambda then invokes the Runtime, and the Runtime writes its own terminal status (`done` + `pr_url` / `failed` / `tests_failed`) back to the same table. DynamoDB TTL on `lease_expires_at` provides best-effort cleanup; the lease comparison in the claim is the authoritative reclaim gate.
 
 ## Invocation
 
-The orchestrator sends the TicketPayload as JSON bytes to the AgentCore Runtime:
+The **consumer** Lambda (triggered by the SQS `JobsQueue`) sends the TicketPayload as JSON bytes to the AgentCore Runtime:
 
 ```python
 import boto3, json, uuid, os
@@ -99,7 +101,7 @@ response = client.invoke(
 
 Key points:
 
-- The orchestrator calls **`invoke`** on the `bedrock-agentcore` client (not `invoke_harness`).
+- The consumer calls **`invoke`** on the `bedrock-agentcore` client (not `invoke_harness`).
 - `runtimeSessionId` is derived from `sonar_hash` + UUID for traceability, **≥ 33 characters**.
 - The payload is the TicketPayload JSON — no prompt rendering, no natural-language template.
 - The Runtime's `agent.py` receives the payload directly in its `@app.entrypoint` handler.

@@ -10,16 +10,17 @@ See [../specs/runtime.md](../specs/runtime.md) for the full design.
 |------|------------|
 | `Dockerfile` | ARM64 container image: kiro-cli, gh, git, AWS CLI, Node.js, Python |
 | `agent.py` | Deterministic pipeline: clone → branch → kiro-cli → test → retry → commit → push → PR |
-| `requirements.txt` | Python deps (strands-agents, bedrock-agentcore) |
+| `requirements.txt` | Python deps (bedrock-agentcore, boto3) |
 | `.bedrock_agentcore.yaml` | AgentCore starter toolkit deployment config |
 | `.dockerignore` | Files excluded from the Docker build context |
 
 ## How it works
 
-1. The orchestrator sends a **TicketPayload** (JSON) to this Runtime via `bedrock-agentcore:Invoke`.
+1. The SQS consumer Lambda sends a **TicketPayload** (JSON) to this Runtime via `bedrock-agentcore:Invoke`.
 2. `agent.py` receives the payload in its `@app.entrypoint` handler.
-3. It runs a fixed sequence: clone, branch, kiro-cli fix, test, retry loop, commit, push, PR.
-4. Returns a JSON result: `{status, pr_url, tests_passed, attempts}`.
+3. It runs a fixed sequence: configure gh auth (token never in URL/argv), clone, branch, kiro-cli fix, test, retry loop, commit, push, PR.
+4. It writes its terminal job status (`done` + `pr_url` / `failed` / `tests_failed`) to the shared DynamoDB jobs table.
+5. Returns a JSON result: `{status, pr_url, tests_passed, attempts}` (`attempts` is the real kiro-cli attempt count).
 
 ## Deploy
 
@@ -35,9 +36,11 @@ This builds the ARM64 image via CodeBuild, pushes to ECR, and deploys the Runtim
 
 | Var | Required | Purpose |
 |-----|----------|---------|
-| `GITHUB_TOKEN` | Yes | Git clone/push, gh pr create |
+| `GITHUB_TOKEN` | Yes | Git clone/push, gh pr create (via the gh credential helper — never in the clone URL/argv) |
 | `KIRO_API_KEY` | Yes | kiro-cli headless authentication |
 | `MAX_FIX_ATTEMPTS` | No | Retry budget (default: 3) |
+| `DYNAMODB_TABLE` | Yes | Shared jobs table the runtime writes its terminal status to |
+| `REPO_ALLOWLIST` | No | Owner/repo globs re-checked before cloning (defence in depth; empty = allow all) |
 
 ## Local testing
 

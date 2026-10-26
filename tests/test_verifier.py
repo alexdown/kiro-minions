@@ -149,6 +149,66 @@ def test_detect_install_none(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _detect_test_command (#16 gap-fill: cover each ecosystem branch directly)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_test_npm(tmp_path):
+    (tmp_path / "package.json").write_text("{}")
+    assert agent._detect_test_command(tmp_path) == "npm test"
+
+
+def test_detect_test_maven(tmp_path):
+    (tmp_path / "pom.xml").write_text("<project/>")
+    assert agent._detect_test_command(tmp_path) == "mvn test"
+
+
+def test_detect_test_makefile_with_test_target(tmp_path):
+    (tmp_path / "Makefile").write_text("test:\n\tpytest\n")
+    assert agent._detect_test_command(tmp_path) == "make test"
+
+
+def test_detect_test_makefile_without_test_target_falls_through(tmp_path):
+    # A Makefile with no `test:` target must NOT yield `make test`; with no other
+    # signal, detection returns None.
+    (tmp_path / "Makefile").write_text("build:\n\tgcc main.c\n")
+    assert agent._detect_test_command(tmp_path) is None
+
+
+def test_detect_test_pytest_ini(tmp_path):
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    assert agent._detect_test_command(tmp_path) == "pytest"
+
+
+def test_detect_test_pyproject_with_pytest(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\naddopts = '-q'\n"
+    )
+    assert agent._detect_test_command(tmp_path) == "pytest"
+
+
+def test_detect_test_pyproject_without_pytest_falls_through(tmp_path):
+    # A pyproject with no pytest signal and no tests/ dir -> no runner detected.
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    assert agent._detect_test_command(tmp_path) is None
+
+
+def test_detect_test_setup_py_with_tests_dir(tmp_path):
+    (tmp_path / "setup.py").write_text("setup()\n")
+    (tmp_path / "tests").mkdir()
+    assert agent._detect_test_command(tmp_path) == "pytest"
+
+
+def test_detect_test_tests_dir_only(tmp_path):
+    (tmp_path / "tests").mkdir()
+    assert agent._detect_test_command(tmp_path) == "pytest"
+
+
+def test_detect_test_none(tmp_path):
+    assert agent._detect_test_command(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
 # truncate_test_output
 # ---------------------------------------------------------------------------
 

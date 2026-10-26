@@ -1,5 +1,19 @@
 # Dev/test-only dependencies. NOT shipped to the Lambda orchestrator or the
 # AgentCore Runtime container (those have their own requirements.txt).
 pytest==9.1.1
+
+# Coverage tooling (#16). pytest-cov wraps coverage.py; both are pinned to
+# known-good versions compatible with pytest 9.1.1. Coverage is OPT-IN: the
+# default `pytest` run does NOT force --cov (see pyproject.toml), so the suite
+# still runs where these are not installed. In CI run e.g.:
+#   python -m pytest --cov=orchestrator --cov=runtime --cov-report=term-missing \
+#       --cov-fail-under=80
+pytest-cov==5.0.0
+coverage==7.6.1
+
+# Optional real-SDK test path. The runnable suite does NOT import these: it uses
+# the in-memory fakes in tests/fakes.py (see README "Testing"), so it runs with
+# zero installs. moto/boto3 are kept pinned only for an optional real-DynamoDB
+# integration path; no runnable test imports them (#16 moto-vs-fakes decision).
 moto==5.2.4
 boto3==1.43.118

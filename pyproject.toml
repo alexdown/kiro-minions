@@ -1,0 +1,37 @@
+# Project tooling configuration (#16): pytest + coverage.
+#
+# Coverage is OPT-IN. We deliberately do NOT put `--cov` in the default pytest
+# addopts so that `python -m pytest tests/ -q` keeps running in environments
+# WITHOUT pytest-cov installed (the zero-install sandbox suite uses the
+# in-memory fakes in tests/fakes.py and must collect/run with no extra deps).
+#
+# To measure coverage in an environment that has the dev deps installed
+# (pip install -r requirements-dev.txt), run:
+#
+#   python -m pytest --cov=orchestrator --cov=runtime \
+#       --cov-report=term-missing --cov-fail-under=80
+#
+# The [tool.coverage.*] sections below scope measurement to the orchestrator/
+# and runtime/ sources and set the 80% gate.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# NOTE: do NOT add --cov here; coverage stays opt-in (see note above) so the
+# zero-install sandbox run `python -m pytest tests/ -q` keeps working.
+
+[tool.coverage.run]
+branch = true
+source = ["orchestrator", "runtime"]
+# Measurement focuses on the orchestrator Lambda and the runtime pipeline.
+omit = ["tests/*"]
+
+[tool.coverage.report]
+# Fail the run if combined line coverage drops below 80% (#16 target).
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
