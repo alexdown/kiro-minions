@@ -1,6 +1,9 @@
 # ADR-002: Task shape for v1 — scoped vs open-ended
 
-**Status:** PROPOSED (needs your decision — this is the pivotal one)
+**Status:** ACCEPTED — **Option C** (new "spec-executor" worker variant, separate
+from the original one-shot minion). This supersedes an earlier interim record
+that had accepted Option A; the maintainer subsequently chose a multi-task
+spec-executor as the IDE task shape.
 **Context doc:** [../ide-ingress.md](../ide-ingress.md) §4
 
 ## Context
@@ -48,23 +51,69 @@ for open-ended ones, selected by a `task_type` field.
 
 ## Decision
 
-_To be recorded by the maintainer._ Recommendation: **Option A for v1**, with
-**Option C as the growth path** (add an open-ended worker as a second variant
-later, rather than mutating the deterministic one). This keeps the first
-increment small and preserves the B1 guarantees.
+**ACCEPTED: Option C — a new, separate "spec-executor" worker variant.** The IDE
+task is NOT a single scoped fix; it is a whole **`tasks.md`** produced by a local
+spec-driven workflow (Kiro-style `requirements.md` → `design.md` → `tasks.md`,
+often tens of tasks). The developer offloads the entire task list to a remote
+worker that reads it and iterates.
 
-**Questions that decide this:**
-1. What tasks does the customer actually want to hand off first — scoped fixes
-   (lint/type/test failures, SonarQube-style findings, "fix this file") or
-   open-ended feature work?
-2. Is "success = the repo's tests pass" an acceptable acceptance gate for v1?
-3. If open-ended is required soon, is a second worker variant (Option C)
-   acceptable, or must it be one unified worker?
+The original one-shot deterministic pipeline (`runtime/agent.py`, the Jira/
+SonarQube "minion") is **left untouched**. The spec-executor is a **second worker
+variant**, selected by `task_type` on the payload (ADR-005).
+
+**Spec-executor behaviour (v1):**
+
+- **Input:** a `tasks.md` (Kiro spec-tasks format: a markdown checklist of tasks,
+  each with sub-bullets / requirement refs) plus the repo context. The task list
+  may be delivered inline in the payload or referenced in the repo.
+- **Iteration loop (deterministic outer loop, model inside each task):** parse
+  `tasks.md` → for each not-yet-complete task, run a **fresh-context** coding
+  pass (a per-task `kiro-cli` invocation or a sub-agent) scoped to that one task
+  → run tests → **one commit per completed task** → mark the task complete →
+  move to the next. The outer loop is plain deterministic code (faithful to B1:
+  the model reasons only *inside* each per-task pass, not about the workflow).
+- **Fresh context per task:** each task gets a clean brief (the task text + spec
+  context), NOT the accumulated transcript of previous tasks — this mirrors how
+  local Kiro executes a `tasks.md` and keeps per-task cost/variance bounded.
+- **One PR per spec:** all per-task commits land on one fix branch; a single PR
+  is opened for the whole `tasks.md` (ADR-006). Commit-per-task keeps the PR
+  reviewable as an ordered sequence.
+- **Partial failure = stop-at-first-blocker:** if a task cannot be completed (or
+  its tests won't pass after the retry budget), the worker **stops**, commits the
+  tasks done so far, opens a **draft PR**, and writes a status report listing
+  completed vs blocked tasks and why. It does NOT skip ahead.
+- **Ordering & optional parallelism:** tasks are executed **sequentially by
+  default** (a `tasks.md` is usually ordered and interdependent). The worker/
+  orchestrator **MAY** run tasks it judges independent in parallel as an
+  optimisation — this is a **soft goal, not a hard requirement** for v1, and must
+  never reorder dependent tasks or corrupt the single-branch commit sequence.
+  Absent reliable dependency metadata, default to sequential.
+
+**Acceptance** is per-task (the repo's tests pass for that task's change) plus
+"all tasks complete" for the spec; a blocked task downgrades the PR to draft.
+
+**Questions this resolved (answered by the maintainer):**
+1. Task shape = a whole `tasks.md` (multi-task), spec-driven offload — not a
+   single scoped fix.
+2. PR granularity = **one PR per spec, one commit per completed task.**
+3. Partial failure = **stop at first blocker**, draft PR + report.
+4. Parallelism = sequential by default; orchestrator may parallelise independent
+   tasks (soft goal, not required).
 
 ## Consequences
 
-- Option A → the runtime needs little/no change; the work is the ingress +
-  results channel. Option B → a new worker and a new set of reliability/cost
-  controls. This choice sizes the whole feature.
-- Feeds ADR-005 (payload fields — a `task_type` only matters under B/C) and
-  ADR-007 (open-ended tasks need tighter cost guardrails).
+- A **new worker** is built (separate container/entrypoint or a `task_type`
+  branch in the runtime), leaving the one-shot minion unchanged. This is a larger
+  build than Option A and needs: a `tasks.md` parser, a deterministic per-task
+  iteration loop with fresh context, per-task commit/complete bookkeeping,
+  stop-at-first-blocker handling, and a spec-level status report.
+- The outer loop stays deterministic; model reasoning is confined to each
+  per-task coding pass (optionally a sub-agent) — the B1 principle holds.
+- Longer runtime budgets and higher per-job cost than the one-shot path →
+  ADR-007 guardrails (per-actor quota, worker cap, budget alarms) apply with more
+  weight; a per-task timeout and an overall job timeout are needed.
+- Feeds ADR-005 (a `task_type` field selects spec-executor vs one-shot; the
+  payload carries the `tasks.md` / spec reference) and ADR-003 (the `phase`/
+  status should surface per-task progress, e.g. "task 7/20").
+- Intra-spec parallelism is deferred-by-default; if pursued, `tasks.md` needs a
+  dependency convention the parser can read. Noted as a follow-up.

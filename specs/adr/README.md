@@ -19,7 +19,7 @@ Consequences**. Status is one of `PROPOSED` / `ACCEPTED` / `REJECTED` /
 | ADR | Decision | Status | Recommendation |
 |-----|----------|--------|----------------|
 | [ADR-001](ADR-001-developer-authentication.md) | How the IDE / developer authenticates to the ingress | ACCEPTED | OIDC via the customer's existing IdP |
-| [ADR-002](ADR-002-task-shape.md) | Task shape for v1: scoped vs open-ended | ACCEPTED | **A — scoped tasks** |
+| [ADR-002](ADR-002-task-shape.md) | Task shape for v1: scoped vs open-ended | ACCEPTED | **C — new "spec-executor" worker** (reads a whole `tasks.md`, sequential per-task loop, fresh context per task, one PR per spec / one commit per task, stop-at-first-blocker; optional parallelism). Supersedes an earlier interim "A — scoped" record. |
 | [ADR-003](ADR-003-results-channel.md) | Results channel: polling vs streaming | ACCEPTED | **A — polling** for v1 |
 | [ADR-004](ADR-004-idempotency-and-schema.md) | Idempotency key & DynamoDB schema | ACCEPTED | Generic `task_id`, additive schema |
 | [ADR-005](ADR-005-payload-naming.md) | Payload contract naming / generalisation | ACCEPTED | Generalise to `TaskPayload`, keep field names |
