@@ -63,9 +63,11 @@ import boto3
 from botocore.exceptions import ClientError
 
 from parser import (
+    IdeRequestError,
     extract_sonar_hash,
     has_sonarqube_label,
     parse_description_header,
+    parse_ide_request,
     repo_allowed,
 )
 
@@ -316,8 +318,19 @@ def _extract_body(event: dict) -> dict:
     raise ValueError(f"unsupported body type: {type(body)!r}")
 
 
-def _claim_job(sonar_hash: str, ticket_id: str) -> bool:
-    """Atomically claim a job for this sonar_hash.
+def _claim_job(sonar_hash: str, ticket_id: str, extra: dict | None = None) -> bool:
+    """Atomically claim a job for this logical task_id / sonar_hash.
+
+    ``sonar_hash`` is the LOGICAL task_id (ADR-004): for the Jira path it is the
+    SonarQube hash (1:1, unchanged behaviour); for the IDE path it is the
+    derived/supplied task_id. Either way it is written into the PHYSICAL DynamoDB
+    partition-key attribute ``sonar_hash`` (no migration), so the lease /
+    reclaim ConditionExpression and ``_mark_status`` are reused unchanged and the
+    runtime (which writes status keyed by ``sonar_hash``) updates the same row.
+
+    ``extra`` carries additional attributes to persist on the claimed row (e.g.
+    ``source`` / ``actor`` for an IDE task). It must not override the managed
+    bookkeeping fields.
 
     Returns True if we acquired the claim (new or previously-failed), False if a
     blocking record (in_flight / done) already exists -> caller should skip.
@@ -333,6 +346,9 @@ def _claim_job(sonar_hash: str, ticket_id: str) -> bool:
         "updated_at": now,
         "lease_expires_at": lease_expires_at,
     }
+    if extra:
+        for k, v in extra.items():
+            item.setdefault(k, v)
     # A claim succeeds when one of these holds:
     #   * the item does not exist yet,
     #   * its status is "failed" (a previous run failed -> retry allowed),
@@ -401,7 +417,11 @@ def _build_payload(ticket_id: str, summary: str, description: str,
     ticket_url = (
         f"{JIRA_BASE_URL}/browse/{ticket_id}" if JIRA_BASE_URL and ticket_id else ""
     )
+    # TaskPayload superset (ADR-005): additive source/actor; every runtime-read
+    # field name is unchanged. The Jira path emits source="jira" (actor empty).
     return {
+        "source": "jira",
+        "actor": "",
         "ticket_id": ticket_id,
         "summary": summary,
         "description": description,
@@ -411,6 +431,35 @@ def _build_payload(ticket_id: str, summary: str, description: str,
         "fix_branch": header["fix_branch"],
         "file_to_fix": header["file_to_fix"],
         "sonar_hash": sonar_hash,
+    }
+
+
+def _build_ide_payload(mapped: dict) -> dict:
+    """Assemble the TaskPayload (JSON) for an IDE task (source="kiro-ide").
+
+    ``mapped`` comes from ``parse_ide_request``. The derived/supplied logical
+    ``task_id`` is carried in the existing ``sonar_hash`` field (ADR-004/005) so
+    the runtime writes status back to the same claimed row with NO wire change:
+    runtime/agent.py keys ``write_job_status`` on ``sonar_hash`` and falls back
+    to ``fix_branch`` derived from ``sonar_hash``. Jira-only fields
+    (``ticket_url`` / ``ticket_id``) are empty for an IDE task.
+    """
+    task_id = mapped["task_id"]
+    return {
+        "source": "kiro-ide",
+        "actor": mapped["actor"],
+        "ticket_id": "",
+        "summary": mapped["summary"],
+        "description": mapped["description"],
+        "ticket_url": "",
+        "repo_clone_url": mapped["repo_clone_url"],
+        "base_branch": mapped["base_branch"],
+        "fix_branch": mapped["fix_branch"],
+        "file_to_fix": mapped["file_to_fix"],
+        "acceptance": mapped["acceptance"],
+        # Logical task_id carried in the physical partition-key field so the
+        # runtime writes status back to the same row (no runtime wire change).
+        "sonar_hash": task_id,
     }
 
 
@@ -598,5 +647,154 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
             "status": "accepted",
             "sonar_hash": sonar_hash,
             "ticket_id": ticket_id,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kiro IDE ingress (FEAT-002)
+#
+# A second ingress for per-developer IDE tasks (specs/ide-ingress.md). It sits
+# behind an API Gateway HTTP API JWT authorizer (ADR-001), so API Gateway has
+# already VERIFIED the token before this Lambda runs; we only READ the verified
+# claims (sub/email -> actor) and never re-verify the signature. We DO fail
+# closed (401) if no verified claims are present. Everything downstream (the
+# logical-task_id claim on the existing table, the SQS JobsQueue, the runtime)
+# is reused unchanged — only the ingress + payload mapping are new.
+# ---------------------------------------------------------------------------
+
+
+def _extract_jwt_claims(event: dict) -> dict:
+    """Return the verified JWT claims from an HTTP API event, lowercased keys.
+
+    Tolerates two shapes:
+      * API Gateway HTTP API v2: ``event.requestContext.authorizer.jwt.claims``
+        (the authorizer already verified the token, so these claims are trusted).
+      * A direct-dict test shape: a top-level ``claims`` mapping.
+
+    Returns an empty dict when no verified claims are present (the caller fails
+    closed with 401). Never raises.
+    """
+    if not isinstance(event, dict):
+        return {}
+
+    claims = None
+    request_context = event.get("requestContext")
+    if isinstance(request_context, dict):
+        authorizer = request_context.get("authorizer")
+        if isinstance(authorizer, dict):
+            jwt = authorizer.get("jwt")
+            if isinstance(jwt, dict):
+                claims = jwt.get("claims")
+            # Some authorizer shapes put claims directly under authorizer.
+            if claims is None and isinstance(authorizer.get("claims"), dict):
+                claims = authorizer.get("claims")
+
+    # Direct-dict test shape.
+    if claims is None and isinstance(event.get("claims"), dict):
+        claims = event.get("claims")
+
+    if not isinstance(claims, dict):
+        return {}
+    return {str(k).lower(): v for k, v in claims.items()}
+
+
+def _actor_from_claims(claims: dict) -> str:
+    """Derive the actor identity from verified JWT claims (sub/email).
+
+    Prefers ``sub`` (stable subject), falls back to ``email``. Returns an empty
+    string when neither is present (the caller fails closed with 401).
+    """
+    for key in ("sub", "email"):
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
+    """Lambda entry point for the Kiro IDE task ingress (POST /tasks).
+
+    Flow:
+      1. Read the verified JWT claims (401 if no actor identity).
+      2. Parse + map the IDE request body to TaskPayload fields (400 on invalid
+         clone URL / branch / missing required field).
+      3. Enforce the repo allowlist (403) BEFORE any claim/enqueue, matching the
+         Jira path ordering.
+      4. Derive the logical task_id (already done by the parser) and claim it on
+         the existing table (200 skipped if blocked).
+      5. Build the TaskPayload (source="kiro-ide", actor set) and enqueue onto
+         the existing SQS JobsQueue; on enqueue failure mark failed + redacted
+         500.
+      6. Return 202 {status: "accepted", task_id, actor}. No secret or raw
+         runtime output in the response.
+    """
+    # --- Authenticate: read verified JWT claims (fail closed) ---
+    claims = _extract_jwt_claims(event)
+    actor = _actor_from_claims(claims)
+    if not actor:
+        return _response(401, {"error": "missing verified developer identity"})
+
+    # --- Parse the IDE request body ---
+    try:
+        body = _extract_body(event)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return _response(400, {"error": redact(f"invalid request body: {exc}")})
+
+    # --- Validate + map the request to TaskPayload fields ---
+    try:
+        mapped = parse_ide_request(body, actor)
+    except (IdeRequestError, ValueError) as exc:
+        # IdeRequestError covers missing/invalid request fields; the reused
+        # validate_clone_url / validate_branch_name raise plain ValueError on a
+        # bad URL / branch. Both are client errors -> redacted 400.
+        return _response(400, {"error": redact(str(exc))})
+
+    task_id = mapped["task_id"]
+    repo_clone_url = mapped["repo_clone_url"]
+
+    # --- Repo allowlist gate (before any claim/enqueue, like the Jira path) ---
+    if not repo_allowed(repo_clone_url, REPO_ALLOWLIST):
+        return _response(
+            403,
+            {"error": redact(f"repo not in allowlist: {repo_clone_url}")},
+        )
+
+    # --- Idempotency claim (logical task_id -> physical sonar_hash attr) ---
+    try:
+        claimed = _claim_job(
+            task_id, task_id, extra={"source": "kiro-ide", "actor": actor}
+        )
+    except ClientError as exc:
+        return _response(500, {"error": redact(f"dynamodb error: {exc}")})
+
+    if not claimed:
+        return _response(
+            200,
+            {
+                "status": "skipped",
+                "reason": "task already in_flight or done for this task_id",
+                "task_id": task_id,
+            },
+        )
+
+    # --- Build the TaskPayload and enqueue for the consumer ---
+    payload = _build_ide_payload(mapped)
+
+    try:
+        _enqueue_payload(payload)
+    except Exception as exc:  # noqa: BLE001 - report any enqueue failure
+        # Enqueue failed before any work started: release the claim by marking
+        # the task failed so a later dispatch can retry, then report a redacted
+        # 500. The reason string is redacted and carries no runtime output.
+        _mark_status(task_id, STATUS_FAILED, {"error": redact(str(exc))})
+        return _response(500, {"error": redact(f"enqueue failed: {exc}")})
+
+    return _response(
+        202,
+        {
+            "status": "accepted",
+            "task_id": task_id,
+            "actor": actor,
         },
     )

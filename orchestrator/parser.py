@@ -3,11 +3,18 @@
 No AWS dependencies. These functions extract the machine-readable fields from
 the ticket description's Part 1 structured header block, and the sonar_hash
 from the labels array.
+
+This module also hosts the pure mapper for the Kiro IDE ingress (FEAT-002):
+``parse_ide_request`` validates and maps an IDE task request JSON into the
+``TaskPayload`` field subset, reusing ``validate_clone_url`` /
+``validate_branch_name`` unchanged. See ADR-002 (scoped task shape), ADR-005
+(payload superset).
 """
 
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import re
 
 # Mapping of (lowercased) line-prefix key -> payload field name.
@@ -226,3 +233,134 @@ def has_sonarqube_label(labels: list[str]) -> bool:
     return any(
         (label or "").strip().lower() in wanted for label in labels
     )
+
+
+# ---------------------------------------------------------------------------
+# Kiro IDE ingress (FEAT-002): request validation + mapping to TaskPayload
+#
+# An IDE "task" is ONE tasks.md task item (ADR-002, scoped task shape): a
+# natural-language instruction (-> description -> kiro-cli brief), an optional
+# target file/area hint (-> file_to_fix), and acceptance = tests_pass (v1
+# fixed). The mapper below is pure (no AWS); the handler layer owns auth,
+# idempotency, the allowlist gate, and the enqueue. It REUSES the URL/branch
+# validators above unchanged (ADR-005 keeps the runtime-read field names).
+# ---------------------------------------------------------------------------
+
+# v1 acceptance is fixed to "tests pass" (ADR-002). Future: lint, typecheck, …
+IDE_ACCEPTANCE = "tests_pass"
+
+
+class IdeRequestError(ValueError):
+    """Raised when an IDE task request is missing/invalid (maps to HTTP 400)."""
+
+
+def derive_task_id(actor: str, repo_clone_url: str, base_branch: str,
+                   description: str) -> str:
+    """Derive a stable logical task_id for an IDE task (ADR-004).
+
+    A sha256 over ``actor\\nrepo_clone_url\\nbase_branch\\ndescription``,
+    truncated and prefixed with ``ide-``. Stable for the same inputs so a
+    double-click / dropped-response re-dispatch is idempotent (the derived id
+    is written into the physical ``sonar_hash`` partition-key attribute by the
+    handler, so the claim/lease logic is reused unchanged).
+    """
+    material = "\n".join([
+        actor or "",
+        repo_clone_url or "",
+        base_branch or "",
+        description or "",
+    ])
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"ide-{digest[:32]}"
+
+
+def _require_str(body: dict, field: str) -> str:
+    """Return a required non-empty string field from the IDE request body."""
+    value = body.get(field)
+    if value is None:
+        raise IdeRequestError(f"missing required field: {field}")
+    if not isinstance(value, str):
+        raise IdeRequestError(f"field {field} must be a string")
+    value = value.strip()
+    if not value:
+        raise IdeRequestError(f"field {field} must not be empty")
+    return value
+
+
+def parse_ide_request(body: dict, actor: str) -> dict:
+    """Validate and map an IDE task request into TaskPayload fields.
+
+    ``body`` is the decoded JSON request from the IDE extension; ``actor`` is the
+    authenticated developer identity (from the verified JWT claims, ADR-001).
+
+    Required request fields:
+      * ``repo_clone_url`` — validated with ``validate_clone_url`` unchanged.
+      * ``description`` — the natural-language instruction (= kiro-cli brief).
+      * ``summary`` — a short PR/commit title.
+
+    Optional request fields:
+      * ``base_branch`` — defaults to ``"main"``; validated.
+      * ``file_to_fix`` — target file/area hint (pass-through, not shell-interp).
+      * ``fix_branch`` — caller-supplied; validated. When absent, derived from
+        the task_id as ``kiro/ide-<task_id-fragment>`` and validated.
+      * ``idempotency_key`` — optional client override for the task_id (ADR-004).
+
+    Returns a dict with keys: ``task_id``, ``source``, ``actor``,
+    ``repo_clone_url``, ``base_branch``, ``fix_branch``, ``file_to_fix``,
+    ``description``, ``summary``, ``acceptance``. Raises ``IdeRequestError`` on
+    any missing/invalid field (the handler routes the reason through redact()
+    and returns 400).
+    """
+    if body is None or not isinstance(body, dict):
+        raise IdeRequestError("request body must be a JSON object")
+    if not actor:
+        raise IdeRequestError("missing actor identity")
+
+    repo_clone_url = _require_str(body, "repo_clone_url")
+    validate_clone_url(repo_clone_url)
+
+    description = _require_str(body, "description")
+    summary = _require_str(body, "summary")
+
+    base_branch = body.get("base_branch") or "main"
+    if not isinstance(base_branch, str):
+        raise IdeRequestError("field base_branch must be a string")
+    base_branch = base_branch.strip() or "main"
+    validate_branch_name(base_branch, field="base_branch")
+
+    file_to_fix = body.get("file_to_fix")
+    if file_to_fix is not None and not isinstance(file_to_fix, str):
+        raise IdeRequestError("field file_to_fix must be a string")
+
+    # Derive a stable logical task_id (ADR-004). A client-supplied idempotency
+    # key, if present, overrides the server derivation.
+    idempotency_key = body.get("idempotency_key")
+    if idempotency_key is not None:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise IdeRequestError("field idempotency_key must be a non-empty string")
+        task_id = idempotency_key.strip()
+    else:
+        task_id = derive_task_id(actor, repo_clone_url, base_branch, description)
+
+    fix_branch = body.get("fix_branch")
+    if fix_branch is not None:
+        if not isinstance(fix_branch, str) or not fix_branch.strip():
+            raise IdeRequestError("field fix_branch must be a non-empty string")
+        fix_branch = fix_branch.strip()
+    else:
+        # Derive a fix branch from the task_id and validate it.
+        fix_branch = f"kiro/ide-{task_id[:12]}"
+    validate_branch_name(fix_branch, field="fix_branch")
+
+    return {
+        "task_id": task_id,
+        "source": "kiro-ide",
+        "actor": actor,
+        "repo_clone_url": repo_clone_url,
+        "base_branch": base_branch,
+        "fix_branch": fix_branch,
+        "file_to_fix": file_to_fix,
+        "description": description,
+        "summary": summary,
+        "acceptance": IDE_ACCEPTANCE,
+    }

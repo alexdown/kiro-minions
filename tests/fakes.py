@@ -637,6 +637,31 @@ def _make_bedrock_agentcore_modules() -> tuple[types.ModuleType, types.ModuleTyp
     return pkg, runtime
 
 
+def make_ide_jwt_event(body: Any, claims: dict | None = None,
+                       *, json_string_body: bool = True) -> dict:
+    """Build an API Gateway HTTP API v2 event for the IDE ingress.
+
+    Mirrors the event shape the JWT authorizer produces: verified claims live
+    under ``requestContext.authorizer.jwt.claims`` and the request body is a
+    JSON string (as HTTP API delivers it). Pass ``claims=None`` to simulate a
+    request with NO verified identity (handler must fail closed 401). Pure
+    stdlib — no real AWS/API Gateway.
+    """
+    import json as _json
+
+    event: dict = {}
+    if claims is not None:
+        event["requestContext"] = {
+            "authorizer": {"jwt": {"claims": dict(claims)}}
+        }
+    if body is not None:
+        if json_string_body and not isinstance(body, str):
+            event["body"] = _json.dumps(body)
+        else:
+            event["body"] = body
+    return event
+
+
 def install_sdk_stubs() -> None:
     """Inject fake boto3 / botocore / bedrock_agentcore modules into sys.modules.
 
