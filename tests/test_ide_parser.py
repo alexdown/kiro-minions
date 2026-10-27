@@ -178,3 +178,135 @@ def test_missing_actor_rejected():
 def test_non_dict_body_rejected():
     with pytest.raises(parser.IdeRequestError):
         parser.parse_ide_request(None, ACTOR)
+
+
+# ---------------------------------------------------------------------------
+# task_type discriminator (ADR-002 Option C): one_shot (default) vs spec
+# ---------------------------------------------------------------------------
+
+
+def test_task_type_defaults_to_one_shot():
+    mapped = parser.parse_ide_request(_request(), ACTOR)
+    assert mapped["task_type"] == "one_shot"
+    # Spec-only fields absent for a one_shot job.
+    assert mapped["tasks_md_path"] is None
+    assert mapped["tasks_md"] is None
+
+
+def test_explicit_one_shot_keeps_required_fields():
+    mapped = parser.parse_ide_request(_request(task_type="one_shot"), ACTOR)
+    assert mapped["task_type"] == "one_shot"
+    assert mapped["description"].startswith("Refactor")
+    assert mapped["summary"] == "Exponential backoff for retries"
+
+
+def test_one_shot_still_requires_description():
+    body = _request(task_type="one_shot")
+    del body["description"]
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(body, ACTOR)
+
+
+def test_invalid_task_type_rejected():
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(_request(task_type="open_ended"), ACTOR)
+
+
+def _spec_request(**overrides) -> dict:
+    body = {
+        "repo_clone_url": REPO,
+        "summary": "Implement the whole spec",
+        "task_type": "spec",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_spec_with_tasks_md_path_maps_through():
+    mapped = parser.parse_ide_request(
+        _spec_request(tasks_md_path=".kiro/specs/my-feature/tasks.md"), ACTOR
+    )
+    assert mapped["task_type"] == "spec"
+    assert mapped["tasks_md_path"] == ".kiro/specs/my-feature/tasks.md"
+    assert mapped["tasks_md"] is None
+    # summary still required and carried; description optional (empty here).
+    assert mapped["summary"] == "Implement the whole spec"
+    assert mapped["description"] == ""
+    # Still gets a task_id + validated fix branch + the IDE shape.
+    assert mapped["task_id"].startswith("ide-")
+    assert mapped["source"] == "kiro-ide"
+    assert mapped["acceptance"] == "tests_pass"
+
+
+def test_spec_with_inline_tasks_md_carried():
+    inline = "- [ ] 1. Do the thing\n- [ ] 2. Do the next thing\n"
+    mapped = parser.parse_ide_request(_spec_request(tasks_md=inline), ACTOR)
+    assert mapped["task_type"] == "spec"
+    assert mapped["tasks_md"] == inline
+    assert mapped["tasks_md_path"] is None
+
+
+def test_spec_with_optional_description_carried():
+    mapped = parser.parse_ide_request(
+        _spec_request(
+            tasks_md_path=".kiro/specs/x/tasks.md",
+            description="Extra guidance for the whole spec.",
+        ),
+        ACTOR,
+    )
+    assert mapped["description"] == "Extra guidance for the whole spec."
+
+
+def test_spec_without_any_tasks_source_rejected():
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(_spec_request(), ACTOR)
+
+
+def test_spec_still_requires_summary():
+    body = _spec_request(tasks_md_path=".kiro/specs/x/tasks.md")
+    del body["summary"]
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(body, ACTOR)
+
+
+def test_spec_empty_inline_tasks_md_rejected():
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(_spec_request(tasks_md="   "), ACTOR)
+
+
+# ---------------------------------------------------------------------------
+# tasks_md_path traversal / shape rejection (security control)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "/etc/passwd",            # absolute
+        "../etc/passwd",          # leading parent traversal
+        "a/../b",                 # embedded parent traversal
+        "a/../../b",              # deeper traversal
+        "..",                     # bare parent
+        "-rf",                    # leading dash (option injection)
+        "a b/tasks.md",           # whitespace
+        "a\\b/tasks.md",          # backslash
+        "a/tasks.md\x00",         # NUL
+        "a/dir/",                 # trailing slash (directory)
+        ".",                      # bare dot
+        "x" * 300,                # over the length cap
+    ],
+)
+def test_spec_rejects_bad_tasks_md_path(bad_path):
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(_spec_request(tasks_md_path=bad_path), ACTOR)
+
+
+def test_validate_repo_relative_path_accepts_normal_path():
+    good = ".kiro/specs/my-feature/tasks.md"
+    assert parser.validate_repo_relative_path(good) == good
+
+
+@pytest.mark.parametrize("bad", ["/abs", "../x", "a/../b", "a b", "a\\b", ".."])
+def test_validate_repo_relative_path_rejects(bad):
+    with pytest.raises(parser.IdeRequestError):
+        parser.validate_repo_relative_path(bad)

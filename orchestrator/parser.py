@@ -238,16 +238,40 @@ def has_sonarqube_label(labels: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 # Kiro IDE ingress (FEAT-002): request validation + mapping to TaskPayload
 #
-# An IDE "task" is ONE tasks.md task item (ADR-002, scoped task shape): a
-# natural-language instruction (-> description -> kiro-cli brief), an optional
-# target file/area hint (-> file_to_fix), and acceptance = tests_pass (v1
-# fixed). The mapper below is pure (no AWS); the handler layer owns auth,
-# idempotency, the allowlist gate, and the enqueue. It REUSES the URL/branch
-# validators above unchanged (ADR-005 keeps the runtime-read field names).
+# An IDE "task" carries a ``task_type`` discriminator (ADR-002 Option C):
+#   * ``one_shot`` — ONE scoped instruction (-> description -> kiro-cli brief),
+#     an optional target file/area hint (-> file_to_fix); the original scoped
+#     behaviour, mapped ~1:1 onto the deterministic pipeline.
+#   * ``spec`` — a WHOLE tasks.md offloaded to the spec-executor worker, which
+#     reads the whole task list and iterates task-by-task (one commit per task,
+#     one PR per spec). The task list is delivered inline (``tasks_md``) or by a
+#     traversal-safe repo-relative reference (``tasks_md_path``).
+# Acceptance = tests_pass (v1 fixed). The mapper below is pure (no AWS); the
+# handler layer owns auth, idempotency, the allowlist gate, and the enqueue. It
+# REUSES the URL/branch validators above unchanged (ADR-005 keeps the
+# runtime-read field names).
 # ---------------------------------------------------------------------------
 
 # v1 acceptance is fixed to "tests pass" (ADR-002). Future: lint, typecheck, …
 IDE_ACCEPTANCE = "tests_pass"
+
+# Task-type discriminator (ADR-002 Option C / ADR-005). A ``one_shot`` task is a
+# single scoped instruction mapped ~1:1 onto the existing deterministic pipeline
+# (the original behaviour, kept exactly). A ``spec`` task offloads a WHOLE
+# ``tasks.md`` to the spec-executor worker, which reads the task list and
+# iterates task-by-task. ``one_shot`` is the default when the field is absent so
+# every existing IDE request keeps its current behaviour.
+TASK_TYPE_ONE_SHOT = "one_shot"
+TASK_TYPE_SPEC = "spec"
+TASK_TYPES = frozenset({TASK_TYPE_ONE_SHOT, TASK_TYPE_SPEC})
+
+# A repo-relative path to a tasks.md inside the clone (e.g.
+# ``.kiro/specs/<name>/tasks.md``). This is a SECURITY control: the value may be
+# interpolated into a filesystem read inside the clone, so it must never escape
+# the clone root nor reach a shell as an option. The charset is tight (no
+# backslash, no NUL, no whitespace), and ``..`` segments / leading ``/`` are
+# rejected separately below. Length is capped to keep it bounded.
+_REPO_RELATIVE_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,256}$")
 
 # Every IDE task_id — derived OR client-supplied — carries this prefix so it
 # lives in its own namespace on the table shared with the Jira path (where the
@@ -273,6 +297,46 @@ _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 class IdeRequestError(ValueError):
     """Raised when an IDE task request is missing/invalid (maps to HTTP 400)."""
+
+
+def validate_repo_relative_path(path: str, field: str = "tasks_md_path") -> str:
+    """Validate a conservative, traversal-safe repo-relative POSIX path.
+
+    This is a SECURITY control for the spec-executor's ``tasks_md_path``: the
+    value points at a file INSIDE the clone and may be joined onto the clone
+    root, so it must never escape the clone or reach a shell as an option.
+
+    Rules (raises :class:`IdeRequestError` on any violation):
+      * must be a non-empty string, ``<= 256`` chars, matching
+        ``^[A-Za-z0-9._/-]+$`` (no backslash, no NUL, no whitespace, no shell
+        metacharacters);
+      * must be relative — no leading ``/`` (absolute) and no leading ``-``
+        (which a tool could treat as an option);
+      * must contain no ``..`` path segment (no parent-directory traversal);
+      * must not be a bare ``.`` or end with ``/`` (not a concrete file).
+
+    Returns the path unchanged on success.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise IdeRequestError(f"field {field} must be a non-empty string")
+    value = path.strip()
+    if not _REPO_RELATIVE_PATH_RE.match(value):
+        raise IdeRequestError(
+            f"field {field} must match ^[A-Za-z0-9._/-]{{1,256}}$ "
+            "(conservative repo-relative path)"
+        )
+    if value.startswith("/"):
+        raise IdeRequestError(f"field {field} must be relative (no leading '/')")
+    if value.startswith("-"):
+        raise IdeRequestError(f"field {field} must not start with '-'")
+    if value.endswith("/"):
+        raise IdeRequestError(f"field {field} must reference a file, not a directory")
+    segments = value.split("/")
+    if any(seg == ".." for seg in segments):
+        raise IdeRequestError(f"field {field} must not contain a '..' segment")
+    if value == ".":
+        raise IdeRequestError(f"field {field} must reference a file, not '.'")
+    return value
 
 
 def _normalise_idempotency_key(raw: str) -> str:
@@ -354,10 +418,29 @@ def parse_ide_request(body: dict, actor: str) -> dict:
     ``body`` is the decoded JSON request from the IDE extension; ``actor`` is the
     authenticated developer identity (from the verified JWT claims, ADR-001).
 
-    Required request fields:
+    ``task_type`` (ADR-002 Option C / ADR-005) selects the worker shape and
+    defaults to ``"one_shot"`` when absent:
+
+      * ``"one_shot"`` — a single scoped instruction mapped ~1:1 onto the
+        deterministic pipeline. ``description`` and ``summary`` are REQUIRED
+        (the exact pre-existing behaviour).
+      * ``"spec"`` — a whole ``tasks.md`` offloaded to the spec-executor worker.
+        At least one of ``tasks_md_path`` (a traversal-safe repo-relative path)
+        or ``tasks_md`` (inline content) is REQUIRED; ``description`` becomes
+        OPTIONAL (the tasks.md is the work). ``summary`` is still required
+        (used for the single PR title, ADR-006).
+
+    Required request fields (always):
       * ``repo_clone_url`` — validated with ``validate_clone_url`` unchanged.
-      * ``description`` — the natural-language instruction (= kiro-cli brief).
       * ``summary`` — a short PR/commit title.
+
+    Required for ``one_shot`` only:
+      * ``description`` — the natural-language instruction (= kiro-cli brief).
+
+    Required for ``spec`` only (at least one of):
+      * ``tasks_md_path`` — repo-relative path to the tasks.md, validated with
+        ``validate_repo_relative_path`` (traversal-safe).
+      * ``tasks_md`` — inline tasks.md content.
 
     Optional request fields:
       * ``base_branch`` — defaults to ``"main"``; validated.
@@ -368,20 +451,66 @@ def parse_ide_request(body: dict, actor: str) -> dict:
 
     Returns a dict with keys: ``task_id``, ``source``, ``actor``,
     ``repo_clone_url``, ``base_branch``, ``fix_branch``, ``file_to_fix``,
-    ``description``, ``summary``, ``acceptance``. Raises ``IdeRequestError`` on
-    any missing/invalid field (the handler routes the reason through redact()
-    and returns 400).
+    ``description``, ``summary``, ``acceptance``, ``task_type``, and (for a spec
+    job, else ``None``) ``tasks_md_path`` / ``tasks_md``. Raises
+    ``IdeRequestError`` on any missing/invalid field (the handler routes the
+    reason through redact() and returns 400).
     """
     if body is None or not isinstance(body, dict):
         raise IdeRequestError("request body must be a JSON object")
     if not actor:
         raise IdeRequestError("missing actor identity")
 
+    # Task-type discriminator: default to one_shot so existing requests are
+    # unchanged. Validate against the known set.
+    task_type = body.get("task_type")
+    if task_type is None:
+        task_type = TASK_TYPE_ONE_SHOT
+    if not isinstance(task_type, str):
+        raise IdeRequestError("field task_type must be a string")
+    task_type = task_type.strip() or TASK_TYPE_ONE_SHOT
+    if task_type not in TASK_TYPES:
+        raise IdeRequestError(
+            f"field task_type must be one of {sorted(TASK_TYPES)}"
+        )
+
     repo_clone_url = _require_str(body, "repo_clone_url")
     validate_clone_url(repo_clone_url)
 
-    description = _require_str(body, "description")
     summary = _require_str(body, "summary")
+
+    # Spec-tasks source fields (spec jobs only).
+    tasks_md_path = None
+    tasks_md = None
+
+    if task_type == TASK_TYPE_SPEC:
+        # A spec job identifies the whole tasks.md, not a single instruction.
+        # description is OPTIONAL; accept it when a non-empty string is given.
+        raw_description = body.get("description")
+        if raw_description is None:
+            description = ""
+        elif not isinstance(raw_description, str):
+            raise IdeRequestError("field description must be a string")
+        else:
+            description = raw_description.strip()
+
+        raw_path = body.get("tasks_md_path")
+        if raw_path is not None:
+            tasks_md_path = validate_repo_relative_path(raw_path)
+
+        raw_inline = body.get("tasks_md")
+        if raw_inline is not None:
+            if not isinstance(raw_inline, str) or not raw_inline.strip():
+                raise IdeRequestError("field tasks_md must be a non-empty string")
+            tasks_md = raw_inline
+
+        if tasks_md_path is None and tasks_md is None:
+            raise IdeRequestError(
+                "a spec task requires at least one of tasks_md_path or tasks_md"
+            )
+    else:
+        # one_shot: EXACT pre-existing required-field semantics.
+        description = _require_str(body, "description")
 
     base_branch = body.get("base_branch") or "main"
     if not isinstance(base_branch, str):
@@ -429,4 +558,9 @@ def parse_ide_request(body: dict, actor: str) -> dict:
         "description": description,
         "summary": summary,
         "acceptance": IDE_ACCEPTANCE,
+        "task_type": task_type,
+        # Spec-only source fields; None for a one_shot job so the one-shot
+        # payload is unchanged.
+        "tasks_md_path": tasks_md_path,
+        "tasks_md": tasks_md,
     }

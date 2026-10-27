@@ -625,6 +625,9 @@ def _build_payload(ticket_id: str, summary: str, description: str,
         "base_branch": header["base_branch"],
         "fix_branch": header["fix_branch"],
         "file_to_fix": header["file_to_fix"],
+        # Jira tickets are always scoped one-shot fixes (ADR-002 Option C): the
+        # runtime keeps selecting the proven deterministic pipeline.
+        "task_type": "one_shot",
         "sonar_hash": sonar_hash,
     }
 
@@ -640,7 +643,12 @@ def _build_ide_payload(mapped: dict) -> dict:
     (``ticket_url`` / ``ticket_id``) are empty for an IDE task.
     """
     task_id = mapped["task_id"]
-    return {
+    # Task-type discriminator (ADR-002 Option C / ADR-005): ``one_shot``
+    # (default, unchanged one-shot pipeline) or ``spec`` (whole tasks.md ->
+    # spec-executor worker). Default to one_shot for safety if a mapper somehow
+    # omits it, so the runtime keeps selecting the proven one-shot path.
+    task_type = mapped.get("task_type") or "one_shot"
+    payload = {
         "source": "kiro-ide",
         "actor": mapped["actor"],
         "ticket_id": "",
@@ -652,10 +660,20 @@ def _build_ide_payload(mapped: dict) -> dict:
         "fix_branch": mapped["fix_branch"],
         "file_to_fix": mapped["file_to_fix"],
         "acceptance": mapped["acceptance"],
+        "task_type": task_type,
         # Logical task_id carried in the physical partition-key field so the
         # runtime writes status back to the same row (no runtime wire change).
         "sonar_hash": task_id,
     }
+    # Spec-only source fields: carry them only when present so a one_shot
+    # payload stays byte-for-byte compatible with the existing contract.
+    tasks_md_path = mapped.get("tasks_md_path")
+    if tasks_md_path is not None:
+        payload["tasks_md_path"] = tasks_md_path
+    tasks_md = mapped.get("tasks_md")
+    if tasks_md is not None:
+        payload["tasks_md"] = tasks_md
+    return payload
 
 
 def _invoke_runtime(payload: dict) -> str:
