@@ -9,6 +9,11 @@ reusing `runtime/agent.py` building blocks.
 
 ---
 
+> **Proposed enhancement:** adversarial review + verify-vs-spec gates before the
+> PR are proposed (not yet built) in [verification-gates.md](verification-gates.md)
+> / [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md). Today
+> the only per-task gate is "the repo's tests pass" (§5).
+
 ## 1. What this worker is for
 
 The original one-shot minion (`runtime/agent.py`) fixes ONE scoped thing (one
