@@ -54,6 +54,7 @@ import time
 from pathlib import Path
 
 import agent  # reuse the one-shot pipeline building blocks (RUNNER indirection)
+import review_gates  # shared ADR-008 verification gates (Phase 2, post-loop)
 import tasks_md
 
 
@@ -146,6 +147,112 @@ def _read_tasks_md(payload: dict, repo_dir: Path) -> str:
     return target.read_text(errors="replace")
 
 
+def _resolve_contained_file(repo_dir: Path, rel: str, field: str) -> Path:
+    """Re-validate a repo-relative path and resolve it to a clone-contained file.
+
+    Applies the SAME traversal validation (``_validate_tasks_md_path``) and
+    clone-root containment check used by ``_read_tasks_md`` so the new Gate B
+    spec paths cannot be used to read outside the clone. Raises ValueError on a
+    traversal / containment violation. Does NOT require the file to exist (the
+    caller decides how to treat a missing optional file).
+    """
+    rel = _validate_tasks_md_path(rel, field=field)
+    repo_root = repo_dir.resolve()
+    target = (repo_root / rel).resolve()
+    if repo_root != target and repo_root not in target.parents:
+        raise ValueError(f"{field} escapes the repository root: {rel!r}")
+    return target
+
+
+def _read_spec_acceptance(payload: dict, repo_dir: Path,
+                          tasks_md_path: str | None) -> str | None:
+    """Resolve the Gate B acceptance text (requirements.md / design.md content).
+
+    Precedence (ADR-008 Q3):
+
+    1. INLINE ``payload['requirements_md']`` / ``payload['design_md']`` win.
+    2. Else ``payload['requirements_md_path']`` / ``payload['design_md_path']``
+       (re-validated with ``_validate_tasks_md_path`` + the same clone-root
+       containment check as ``tasks_md_path``), read from inside the clone.
+    3. Else the ``.kiro/specs/<feature>/`` SIBLING default: when
+       ``tasks_md_path`` is ``.kiro/specs/<feature>/tasks.md`` look for
+       ``requirements.md`` / ``design.md`` as siblings next to it.
+
+    Each resolved source is concatenated with a labelled section header. When
+    NOTHING is found, returns None so Gate B is SKIPPED-with-notice (never
+    blocks). Applies the SAME traversal + containment safety as the tasks path;
+    never reads outside the clone root.
+    """
+    sections: list[tuple[str, str]] = []
+
+    def _add(label: str, text: str | None) -> bool:
+        if text is not None and str(text).strip():
+            sections.append((label, str(text)))
+            return True
+        return False
+
+    # (1) Inline wins, per-doc and independently.
+    have_requirements = _add("requirements.md", payload.get("requirements_md"))
+    have_design = _add("design.md", payload.get("design_md"))
+
+    # (2) Explicit paths (re-validated + clone-contained) fill any doc not
+    # already supplied inline.
+    if not have_requirements:
+        rel = payload.get("requirements_md_path")
+        if rel is not None:
+            target = _resolve_contained_file(
+                repo_dir, rel, field="requirements_md_path",
+            )
+            if target.is_file():
+                have_requirements = _add(
+                    "requirements.md", target.read_text(errors="replace"),
+                )
+    if not have_design:
+        rel = payload.get("design_md_path")
+        if rel is not None:
+            target = _resolve_contained_file(
+                repo_dir, rel, field="design_md_path",
+            )
+            if target.is_file():
+                have_design = _add(
+                    "design.md", target.read_text(errors="replace"),
+                )
+
+    # (3) .kiro/specs/<feature>/ sibling default for any doc still missing: only
+    # when the tasks path is itself under .kiro/specs/<feature>/tasks.md.
+    if (not have_requirements or not have_design) and tasks_md_path:
+        try:
+            tasks_target = _resolve_contained_file(
+                repo_dir, tasks_md_path, field="tasks_md_path",
+            )
+        except ValueError:
+            tasks_target = None
+        if tasks_target is not None:
+            parent = tasks_target.parent
+            # Confirm the shape .kiro/specs/<feature>/tasks.md.
+            if (tasks_target.name == "tasks.md"
+                    and parent.parent.name == "specs"
+                    and parent.parent.parent.name == ".kiro"):
+                if not have_requirements:
+                    sib = parent / "requirements.md"
+                    if sib.is_file():
+                        have_requirements = _add(
+                            "requirements.md", sib.read_text(errors="replace"),
+                        )
+                if not have_design:
+                    sib = parent / "design.md"
+                    if sib.is_file():
+                        have_design = _add(
+                            "design.md", sib.read_text(errors="replace"),
+                        )
+
+    if not sections:
+        return None
+    return "\n\n".join(
+        f"=== {label} ===\n{text}" for label, text in sections
+    )
+
+
 def _build_spec_task_brief(task: tasks_md.SpecTask, summary: str,
                            spec_header: str, index: int, total: int) -> str:
     """Compose the FRESH per-task kiro brief (delivered via STDIN, never argv).
@@ -212,11 +319,19 @@ def _run_task_kiro(repo_dir: Path, brief: str) -> None:
 
 
 def _build_spec_pr_body(summary: str, sonar_hash: str, completed: list[dict],
-                        blocked: dict | None) -> str:
+                        blocked: dict | None,
+                        verification_section: str | None = None) -> str:
     """Compose the spec-executor PR body (always routed through redact() by the
     caller). Lists the completed tasks as an ordered sequence and, when the job
     stopped early, names the blocked task and WHY (redacted failing output or a
     budget reason).
+
+    When ``verification_section`` is provided (the ADR-008 Phase-2 gates ran) it
+    is appended as a ``## Verification`` block that already names any gate that
+    downgraded the PR to a draft + its findings (rendered by
+    ``review_gates.render_verification_section``). It is ``None`` whenever the
+    gates did not run (flags off, or a Phase-1 blocker short-circuited Phase 2),
+    keeping the happy/blocker body byte-for-byte unchanged.
 
     This is deliberately NOT ``agent._build_pr_body`` (which is SonarQube-shaped
     and single-fix); a spec body is a task list.
@@ -263,23 +378,30 @@ def _build_spec_pr_body(summary: str, sonar_hash: str, completed: list[dict],
     else:
         lines += ["All tasks in the spec completed successfully.", ""]
 
+    if verification_section:
+        lines += [verification_section.strip(), ""]
+
     lines += ["This PR was generated automatically by kiro-minions.", ""]
     return "\n".join(lines)
 
 
 def _open_spec_pr(repo_dir: Path, base_branch: str, fix_branch: str,
                   summary: str, sonar_hash: str, completed: list[dict],
-                  blocked: dict | None, *, draft: bool) -> str:
+                  blocked: dict | None, *, draft: bool,
+                  verification_section: str | None = None) -> str:
     """Open ONE spec PR via the same gh-create-via-RUNNER argv-list shape
     agent.step_open_pr uses. The body is built by ``_build_spec_pr_body`` and
     ALWAYS passed through agent.redact() so no secret can leak. No secret is
-    ever placed in the gh argv."""
+    ever placed in the gh argv. ``verification_section`` (ADR-008 Phase 2) is
+    threaded into the body when the gates ran; ``None`` leaves the body
+    unchanged."""
     pr_title = agent.redact(f"spec: {summary or 'spec execution'} [{sonar_hash}]")
     if draft:
         pr_title = f"[DRAFT] {pr_title}"
 
     pr_body = agent.redact(
-        _build_spec_pr_body(summary, sonar_hash, completed, blocked)
+        _build_spec_pr_body(summary, sonar_hash, completed, blocked,
+                            verification_section)
     )
 
     argv = [
@@ -522,11 +644,66 @@ def run_spec_pipeline(payload: dict) -> dict:
         log.info("=== SPEC STEP: Push ===")
         agent.step_push(repo_dir, fix_branch)
 
+        # -----------------------------------------------------------------
+        # PHASE 2 — VERIFY GATES (ADR-008, post-loop, runs ONCE).
+        #
+        # Runs ONLY when Phase 1 completed ALL tasks (blocked is None) and there
+        # is a cumulative change to verify. A Phase-1 blocker means there is no
+        # complete change to review, so the gates DO NOT run and today's
+        # blocker/draft-PR behaviour is preserved exactly. With both gate flags
+        # OFF review_gates.run_gates skips both gates, gate_driven_draft stays
+        # False, and verification_section stays None, so the happy/blocker body
+        # and the non-draft/draft decision below are byte-for-byte unchanged.
+        # -----------------------------------------------------------------
+        gate_driven_draft = False
+        gate_failed_labels: list[str] = []
+        verification_section: str | None = None
+        if blocked is None and completed:
+            tasks_md_path = payload.get("tasks_md_path")
+            diff_result = agent._run(
+                ["git", "diff", f"{base_branch}..{fix_branch}"],
+                cwd=repo_dir, check=False,
+            )
+            diff = diff_result.stdout or ""
+            if diff.strip():
+                # Gate A intent: the job summary + a bounded tasks.md header
+                # slice already in scope (fresh-context reviewer orientation).
+                intent_parts = []
+                if summary:
+                    intent_parts.append(summary)
+                if spec_header:
+                    intent_parts.append(spec_header)
+                intent = "\n\n".join(intent_parts)
+
+                acceptance_text = _read_spec_acceptance(
+                    payload, repo_dir, tasks_md_path,
+                )
+
+                # Write the gate phases (ADR-003) BEFORE running each gate, AFTER
+                # the per-task 'task N/total' phases.
+                agent.write_phase(sonar_hash, "reviewing")
+                phase_result = review_gates.run_gates(
+                    repo_dir, diff, intent, acceptance_text,
+                )
+                # Gate B is the verify-vs-spec pass; surface its phase too. Both
+                # gates already ran inside run_gates (bounded, no loop); the
+                # second write_phase simply advances the status string so a
+                # polling client sees the verify stage.
+                agent.write_phase(sonar_hash, "verifying-spec")
+
+                if phase_result.any_gate_ran:
+                    gate_driven_draft = phase_result.should_draft
+                    gate_failed_labels = list(phase_result.failed_gate_labels)
+                    verification_section = phase_result.verification_section
+
         agent.write_phase(sonar_hash, agent.PHASE_OPENING_PR)
-        draft = blocked is not None
+        # Draft drivers: a Phase-1 blocker (as today) OR a Phase-2 gate
+        # downgrade. When blocked is None the ONLY draft driver is the gates.
+        draft = blocked is not None or gate_driven_draft
         pr_url = _open_spec_pr(
             repo_dir, base_branch, fix_branch, summary, sonar_hash,
             completed, blocked, draft=draft,
+            verification_section=verification_section,
         )
 
     elapsed_total = int(time.monotonic() - started)
@@ -543,6 +720,26 @@ def run_spec_pipeline(payload: dict) -> dict:
         return {
             "status": agent.STATUS_TESTS_FAILED,
             "reason": blocked["reason"],
+            "pr_url": pr_url,
+            "draft": True,
+            "tasks": tasks_summary,
+            "elapsed": elapsed_total,
+        }
+
+    # A gate-driven draft (no Phase-1 blocker): commits are kept/pushed (ADR-008
+    # Q4), the PR is a DRAFT, and the status maps to the existing
+    # RETRYABLE-ish STATUS_TESTS_FAILED so the dispatch layer surfaces a
+    # "needs-human" terminal state (mirroring the blocker mapping) rather than a
+    # clean success. A redacted reason names the failed gate(s). The flags-OFF
+    # path never reaches this branch (gate_driven_draft stays False), so the
+    # existing non-draft success result shape is unchanged.
+    if gate_driven_draft:
+        return {
+            "status": agent.STATUS_TESTS_FAILED,
+            "reason": agent.redact(
+                "verification gate(s) flagged the change: "
+                + ", ".join(gate_failed_labels)
+            ),
             "pr_url": pr_url,
             "draft": True,
             "tasks": tasks_summary,
