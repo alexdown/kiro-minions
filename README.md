@@ -105,9 +105,21 @@ read-only status poll. Result delivery is unchanged: the fix still arrives as a
 > **not** a wire change. A Jira payload carries `source="jira"`; an IDE payload
 > carries `source="kiro-ide"` and the developer's `actor` identity.
 
-An **IDE task is one `tasks.md` task item** (Kiro spec-driven workflow, ADR-002):
-a natural-language `instruction` (→ the kiro-cli brief), an optional `target`
-file/area hint (→ `file_to_fix`), and acceptance fixed to **tests pass** in v1.
+An **IDE task comes in two shapes** (selected by a `task_type` discriminator,
+ADR-002), both with acceptance fixed to **tests pass** in v1:
+
+- **`one_shot`** (the original scoped fix): a natural-language `instruction`
+  (→ the kiro-cli brief) and an optional `target` file/area hint
+  (→ `file_to_fix`). It reuses `runtime/agent.py` unchanged.
+- **`spec`** (the headline IDE shape): a **whole `tasks.md`** produced by a
+  local Kiro spec-driven workflow (`requirements.md` → `design.md` →
+  `tasks.md`, often tens of tasks). The developer offloads the ENTIRE task list
+  to the remote **spec-executor** worker (`runtime/spec_agent.py`), which reads
+  the list and iterates task-by-task: a fresh per-task brief, one commit per
+  completed task on one branch, one PR per spec, and stop-at-first-blocker. The
+  task list is referenced by a repo-relative `tasks_md_path` (read after clone)
+  or passed inline as `tasks_md`. See
+  [specs/spec-executor.md](specs/spec-executor.md).
 
 ### Endpoints
 
@@ -120,6 +132,7 @@ the Lambda runs, and the Lambda only reads the verified claims (`sub`/`email` �
 
 ```json
 {
+  "task_type": "one_shot",
   "repo_clone_url": "https://github.com/your-org/your-repo.git",
   "description": "Add input validation to the login form.",
   "summary": "Validate login form input",
@@ -129,10 +142,28 @@ the Lambda runs, and the Lambda only reads the verified claims (`sub`/`email` �
 }
 ```
 
-- `repo_clone_url`, `description`, `summary` are **required**; `base_branch`
-  (default `main`), `file_to_fix`, `fix_branch`, and `idempotency_key` are
-  optional. The clone URL and branch names are validated by the **same**
-  strict validators the Jira path uses.
+A **spec** job offloads a whole `tasks.md` instead (see
+[specs/spec-executor.md](specs/spec-executor.md)):
+
+```json
+{
+  "task_type": "spec",
+  "repo_clone_url": "https://github.com/your-org/your-repo.git",
+  "summary": "Execute the checkout-redesign spec",
+  "base_branch": "main",
+  "tasks_md_path": ".kiro/specs/checkout-redesign/tasks.md"
+}
+```
+
+- `task_type` selects the pipeline: `one_shot` (default when absent) or `spec`.
+- For a **one_shot** job, `repo_clone_url`, `description`, `summary` are
+  **required**; `base_branch` (default `main`), `file_to_fix`, `fix_branch`,
+  and `idempotency_key` are optional.
+- For a **spec** job, `repo_clone_url` and `summary` (used for the PR title) are
+  **required** plus EITHER `tasks_md_path` (a traversal-validated repo-relative
+  path, read after clone) OR inline `tasks_md`; `description` is optional (the
+  `tasks.md` is the work). The clone URL and branch names are validated by the
+  **same** strict validators the Jira path uses.
 - **Server-derived `task_id`.** By default the `task_id` is a stable
   `sha256(actor + repo_clone_url + base_branch + description)` (prefixed
   `ide-`), so a double-click / dropped-response re-dispatch is idempotent. A
@@ -384,4 +415,5 @@ reclaim gate, independent of when the TTL sweeper runs.
 - [specs/payload.md](specs/payload.md) — payload schema + ticket parsing
 - [specs/runtime.md](specs/runtime.md) — Runtime container design and deployment
 - [specs/ide-ingress.md](specs/ide-ingress.md) — Kiro IDE task ingress (remote worker hand-off)
+- [specs/spec-executor.md](specs/spec-executor.md) : spec-executor worker (whole `tasks.md` offload, ADR-002 Option C)
 - [specs/adr/README.md](specs/adr/README.md) — Architecture Decision Registry

@@ -47,6 +47,14 @@ The Docker image (`runtime/Dockerfile`) is ARM64 and pre-installs:
 
 ## Pipeline: `agent.py`
 
+> **See also: the spec-executor.** This doc describes the ONE-SHOT pipeline
+> (`agent.py`, `task_type="one_shot"`): one brief, one fix, one PR. A second
+> worker variant, the **spec-executor** (`runtime/spec_agent.py`,
+> `task_type="spec"`), reuses the building blocks below to run a whole
+> `tasks.md` task-by-task (one commit per task, one PR per spec,
+> stop-at-first-blocker). Its design lives in
+> [spec-executor.md](spec-executor.md); the one-shot path is left unchanged.
+
 The entrypoint is a deterministic sequential script:
 
 ```

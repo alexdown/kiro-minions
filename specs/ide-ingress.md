@@ -41,8 +41,10 @@ authenticated API that the IDE extension calls to dispatch a task, plus a
 - Building the VSCode extension itself (the customer owns that; we define the
   contract it calls).
 - Streaming the full agent transcript to the IDE (status milestones only in v1).
-- Running arbitrary "implement this whole feature" tasks **if** ADR-002 lands on
-  the scoped-task option (see §4 and ADR-002).
+- An open-ended, model-in-a-loop worker. ADR-002 landed on Option C: a whole
+  `tasks.md` is run by a deterministic spec-executor whose outer loop is plain
+  code, with model reasoning confined to each per-task pass (see §4 and ADR-002).
+  There is no open-ended outer model loop.
 
 ---
 
@@ -57,7 +59,7 @@ The pipeline today is Jira-shaped only at its two ends:
 | `TicketPayload` contract | Partly (field names) | Generalise to a `TaskPayload` (§5) |
 | Idempotency / lease (`_claim_job`, DynamoDB) | No | Reuse; key becomes a generic `task_id` (ADR-004) |
 | SQS `JobsQueue` + DLQ + consumer Lambda | No | **Reuse unchanged** |
-| AgentCore Runtime pipeline (`agent.py`) | Partly (assumes a scoped fix) | Reuse; see ADR-002 for task shape |
+| AgentCore Runtime pipeline (`agent.py`) | Partly (assumes a scoped fix) | Reused unchanged for `one_shot`; a second variant (`spec_agent.py`) reuses its building blocks for `spec` (ADR-002 Option C) |
 | Status write-back to DynamoDB | No | Reuse; add a read API in front (§6) |
 | Security controls (allowlist, redaction, argv, shell=False) | No | **Reuse unchanged** |
 
@@ -114,40 +116,61 @@ two HTTP endpoints, which keeps AWS creds and the runtime ARN server-side.
 ## 4. The crux: what *is* an IDE task? (drives most of the design)
 
 The Jira ingress handles a **narrow, structured task**: "fix this specific
-SonarQube finding in this file." The deterministic pipeline is built around that
-shape — one `kiro-cli` brief, auto-detected tests, up to 3 retries, one PR.
+SonarQube finding in this file." The one-shot deterministic pipeline is built
+around that shape: one `kiro-cli` brief, auto-detected tests, up to 3 retries,
+one PR.
 
-"Work assigned from an IDE" is open-ended. The single most important decision
-(ADR-002) is which of these we support in v1:
+An IDE task is bigger. ADR-002 is **ACCEPTED as Option C**: the headline IDE
+shape is a **whole `tasks.md`** produced by a local spec-driven workflow (the
+Kiro flow: `requirements.md`, then `design.md`, then `tasks.md`, often tens of
+tasks). The developer offloads the ENTIRE task list to a remote worker that
+reads it and iterates task-by-task. Both shapes are supported, selected by a
+`task_type` discriminator on the payload (§5):
 
-- **Option A — Scoped tasks (recommended v1).** The IDE sends a bounded task:
-  repo + base branch + a target (file/area) + a natural-language instruction +
-  acceptance = tests pass. This maps almost 1:1 onto today's pipeline and the
-  `description` → kiro-cli brief flow. Lowest risk, fastest to ship, keeps B1.
-- **Option B — Open-ended tasks.** "Implement feature X across the repo." This
-  likely needs the plan→code→review loop (a richer worker), not the single-shot
-  deterministic pipeline. Bigger build, new failure modes, higher cost per task,
-  and it reopens the "outer model loop" question the B1 design deliberately
-  avoided.
+- **`task_type="one_shot"` (the original scoped path, retained).** A bounded
+  task: repo + base branch + an optional target (file/area) + a natural-language
+  `instruction` + acceptance = tests pass. It maps 1:1 onto the existing
+  pipeline (`description` → kiro-cli brief) and `runtime/agent.py` is reused
+  unchanged.
+- **`task_type="spec"` (the headline IDE shape).** A whole `tasks.md` (inline or
+  referenced in the repo) run by a NEW, SEPARATE **spec-executor** worker
+  variant (`runtime/spec_agent.py`). Its outer loop is deterministic plain code
+  (model reasoning stays inside each per-task pass, faithful to B1); it runs a
+  fresh per-task brief, commits once per completed task on a single branch, and
+  opens one PR per spec with stop-at-first-blocker semantics.
 
-**Recommendation:** ship **Option A** first (reuses the runtime, proves the
-hand-off and scaling), and treat Option B as a follow-up that may introduce a
-*second* runtime variant rather than changing the deterministic one. This needs
-your decision — see ADR-002.
+ADR-002 is the authority for this decision. The spec-executor's full design
+(tasks.md source, the outer loop, budgets, the `task N/total` progress phase,
+security reuse, and the deferred parallelism follow-up) lives in
+[spec-executor.md](spec-executor.md). The original one-shot minion
+(`runtime/agent.py`, the Jira/SonarQube path) is left behaviourally unchanged.
 
 ---
 
 ## 5. Payload contract (generalising `TicketPayload` → `TaskPayload`)
 
-Today the runtime consumes a `TicketPayload` (see [payload.md](payload.md)). The
-IDE ingress should produce the **same downstream contract** so SQS/consumer/
-runtime don't change. Proposed generalisation (names TBD — ADR-005):
+The runtime consumes a `TaskPayload` (a superset of the original
+`TicketPayload`, see [payload.md](payload.md) and ADR-005). The IDE ingress
+produces the **same downstream contract** so SQS / consumer / runtime do not
+change. A `task_type` discriminator selects which pipeline runs:
+
+- `task_type="one_shot"` (default when absent): the original scoped-fix path.
+  `description`, `summary`, and `repo_clone_url` are **required**.
+- `task_type="spec"`: the whole-`tasks.md` spec-executor path. It requires
+  `repo_clone_url`, `summary` (used for the PR title), and EITHER
+  `tasks_md_path` (a traversal-validated repo-relative path, read after the
+  clone) OR inline `tasks_md`. For a spec job `description` is **optional** (the
+  `tasks.md` is the work).
+
+**one_shot example:**
 
 ```jsonc
 {
   "task_id":        "ide-7f3c…",          // idempotency key (ADR-004)
+  "sonar_hash":     "ide-7f3c…",          // physical key carries the task_id (ADR-004/005)
   "source":         "kiro-ide",           // vs "jira"; for routing/audit
   "actor":          "dev@customer.com",   // who dispatched (from auth, ADR-001)
+  "task_type":      "one_shot",           // scoped single fix (ADR-002)
   "repo_clone_url": "https://github.com/org/repo.git",
   "base_branch":    "main",
   "fix_branch":     "kiro/ide-7f3c…",     // or caller-supplied (validated)
@@ -158,21 +181,49 @@ runtime don't change. Proposed generalisation (names TBD — ADR-005):
 }
 ```
 
+**spec example (whole `tasks.md`):**
+
+```jsonc
+{
+  "task_id":        "ide-9a21…",
+  "sonar_hash":     "ide-9a21…",          // physical key carries the task_id
+  "source":         "kiro-ide",
+  "actor":          "dev@customer.com",
+  "task_type":      "spec",               // whole tasks.md → spec-executor (ADR-002 Option C)
+  "repo_clone_url": "https://github.com/org/repo.git",
+  "base_branch":    "main",
+  "fix_branch":     "kiro-minions/spec-ide-9a21…",
+  "tasks_md_path":  ".kiro/specs/checkout-redesign/tasks.md", // repo-relative; read after clone
+  // "tasks_md":    "# Implementation Plan\n- [ ] 1. …",      // OR inline, instead of a path
+  "summary":        "Execute the checkout-redesign spec",     // required (PR title)
+  "acceptance":     "tests_pass"
+}
+```
+
 - Fields that already exist keep their names and validation
   (`validate_clone_url`, `validate_branch_name`) unchanged.
-- `sonar_hash` (Jira-only) becomes an optional `source`-specific field; the
-  generic idempotency key is `task_id` (ADR-004). The DynamoDB key rename has
-  migration implications — see ADR-004.
+- The generic idempotency key is `task_id` (ADR-004); it is carried in the
+  **physical `sonar_hash` partition-key attribute** on the shared table so the
+  claim/lease logic, the consumer, and the runtime are reused unchanged. The
+  Jira-only `sonar-hash` *label* remains the Jira path's source for that value.
+- `task_type` selects the pipeline (`one_shot` vs `spec`); it defaults to
+  `one_shot` when absent so an existing IDE request keeps its behaviour.
+- The spec-only fields are `tasks_md_path` (a conservative repo-relative path
+  matching `^[A-Za-z0-9._/-]{1,256}$`, no leading `/`, no `..` segment, so it
+  can neither escape the clone nor reach a shell as an option) and `tasks_md`
+  (inline content). At least one is required for a spec job; inline wins when
+  both are present. They are absent/None for a one_shot job.
 - A caller MAY supply an optional `idempotency_key` to override the derived
   `task_id`. Because this value becomes the physical `sonar_hash` partition key
   on a table shared with the Jira path and the per-actor `quota#…` counters, it
   is **constrained**: it is forced into the `ide-` namespace and must match
   `^[A-Za-z0-9._-]{1,128}$` (after an optional leading `ide-`). This rejects
   `#` (so it cannot land in the `quota#…` namespace), whitespace, and overlong
-  values — a client can neither collide with a Jira hash / quota counter nor
+  values, so a client can neither collide with a Jira hash / quota counter nor
   target another tenant's row via the status API's by-key read.
-- The runtime needs **no change** if we keep `description` as the kiro-cli brief
-  and `acceptance=tests_pass`.
+- The one_shot runtime path needs **no change**: `description` stays the
+  kiro-cli brief and `acceptance=tests_pass`. The spec path adds the
+  spec-executor worker (see [spec-executor.md](spec-executor.md)).
 
 ---
 
@@ -244,33 +295,43 @@ before dispatch. This is a workflow contract to confirm with the customer.
 
 ## 9. Phasing (proposed)
 
-1. **Spike / design (this doc + ADRs).** Lock ADR-001/002/003/004/006/007.
+1. **Spike / design (this doc + ADRs).** ADR-001..007 are ACCEPTED (ADR-002 as
+   Option C). Done.
 2. **Thin PoC:** new ingress Lambda + `/tasks` route that authenticates, maps an
    IDE request → `TaskPayload`, claims, and enqueues onto the **existing** SQS.
    Reuse everything downstream. Add `GET /tasks/{id}` reading the status row.
-   Prove one task dispatched from a script end-to-end to a PR.
+   Done.
 3. **IDE integration:** customer extension calls `/tasks` + polls `/tasks/{id}`.
 4. **Hardening:** per-actor quotas, concurrency caps, cost alarms, audit log,
-   intermediate status phases for progress UX.
-5. **(Optional) Option B** open-ended tasks as a separate worker variant.
+   intermediate status phases for progress UX. Done.
+5. **Spec-executor worker (ADR-002 Option C, done):** the `task_type="spec"`
+   variant that runs a whole `tasks.md` (deterministic outer loop, one commit
+   per task, one PR per spec, stop-at-first-blocker). See
+   [spec-executor.md](spec-executor.md).
+6. **(Follow-up) Intra-spec parallelism** for independent tasks: deferred, needs
+   a `tasks.md` dependency convention (see [spec-executor.md](spec-executor.md)
+   §10).
 
 Each phase ships with unit tests using the existing fakes; no real AWS/GitHub in
 tests; keep the diff focused per phase.
 
 ---
 
-## 10. Open questions for you
+## 10. Decisions (ADRs)
 
-These are captured as ADRs needing a decision in [adr/README.md](adr/README.md):
+All of the decisions below are **ACCEPTED** and implemented; the full records
+are in [adr/README.md](adr/README.md):
 
-- **ADR-001** — developer authentication mechanism.
-- **ADR-002** — task shape: scoped (A) vs open-ended (B) for v1.
-- **ADR-003** — results channel: polling (A) vs streaming (B).
-- **ADR-004** — idempotency key & DynamoDB schema (reuse `sonar_hash` table vs
-  new generic `task_id` / new table).
-- **ADR-005** — payload naming (`TicketPayload` + `source` vs new `TaskPayload`).
-- **ADR-006** — result delivery: PR / branch / patch.
-- **ADR-007** — concurrency, quota, and cost guardrails for scaled parallelism.
-
-Nothing here is built yet — this branch is specs only. Once you've recorded the
-decisions in the ADRs, a fresh session can pick up Phase 2 (the thin PoC).
+- **ADR-001**: developer authentication: OIDC via the customer's existing IdP.
+- **ADR-002**: task shape: **Option C**, a new "spec-executor" worker variant
+  that runs a whole `tasks.md` (plus the retained `one_shot` scoped path),
+  selected by `task_type`. See [spec-executor.md](spec-executor.md).
+- **ADR-003**: results channel: polling for v1 (with a `phase` field, including
+  the spec-executor's `task N/total`).
+- **ADR-004**: idempotency key & DynamoDB schema: a generic `task_id` carried
+  in the physical `sonar_hash` key; additive schema.
+- **ADR-005**: payload naming: generalise to `TaskPayload`, keep field names,
+  add `task_type` and the spec-only fields.
+- **ADR-006**: result delivery: a GitHub PR (one per spec; draft on a blocker).
+- **ADR-007**: concurrency, quota, and cost guardrails for scaled parallelism,
+  with per-task/per-job budgets in the spec-executor.
