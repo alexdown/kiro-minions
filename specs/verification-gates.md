@@ -1,7 +1,9 @@
 # Spec: verification gates for the spec-executor (adversarial review + verify-vs-spec)
 
-**Status:** DRAFT v1 — PROPOSAL for review. No code. Specs only.
-**Decision record:** [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md) (PROPOSED — needs your decisions)
+**Status:** ACCEPTED — implementation in progress. (Gate placement is post-loop,
+once per task group; see §3. Decisions Q1–Q7 recorded in the ADR, with Q6
+overridden to apply to BOTH worker paths.)
+**Decision record:** [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md) (ACCEPTED)
 **Builds on:** [spec-executor.md](spec-executor.md), [adr/ADR-002-task-shape.md](adr/ADR-002-task-shape.md)
 **Inspiration:** the "AI Software Development Lifecycle" pattern — `BUILD → VERIFY → REVIEW → VERIFY-VS-SPEC → human gate`, with review failures looping back to the builder and spec failures escalating to the planner.
 
@@ -201,9 +203,13 @@ Gate A needs no new inputs (it works from the cumulative branch diff + the
 - Not a re-plan engine by default — a gate failure opens a draft PR for a human;
   an autonomous bounded auto-remediation pass is an explicit, larger option
   (ADR-008 Q4), out of scope unless you choose it.
-- Not applied to the one-shot minion — this is a spec-executor enhancement; the
-  `task_type="one_shot"` path is unchanged (a post-fix review phase *could* be
-  added there later; ADR-008 Q6).
+- Applied to BOTH worker paths (ADR-008 Q6, maintainer override): the
+  spec-executor runs the gates post-loop on the cumulative diff, and the one-shot
+  minion runs the same gates post-fix before its PR (there Gate B is a
+  skip-with-notice until it has acceptance criteria). Both share one gate module
+  and both are behind the default-off flags, so each path is unchanged when the
+  flags are off. This is a bounded, post-step review — NOT a change to either
+  path's existing loop.
 
 ---
 

@@ -26,7 +26,7 @@ Consequences**. Status is one of `PROPOSED` / `ACCEPTED` / `REJECTED` /
 | [ADR-005](ADR-005-payload-naming.md) | Payload contract naming / generalisation | ACCEPTED | Generalise to `TaskPayload`, keep field names |
 | [ADR-006](ADR-006-result-delivery.md) | How the result reaches the dev: PR / branch / patch | ACCEPTED | **A — PR** |
 | [ADR-007](ADR-007-concurrency-and-cost-guardrails.md) | Concurrency, quota & cost guardrails for scaled parallelism | ACCEPTED | **A+B+C+D (alert-only)+E** — reserved concurrency + worker cap via SQS backpressure + per-actor quota + budget alarms (alert-only, hard cap deferred) + audit log |
-| [ADR-008](ADR-008-verification-gates.md) | Verification gates for the spec-executor: adversarial review + verify-vs-spec before the PR | **PROPOSED** | A bounded, B1-preserving **post-loop** review phase (both gates run once, after the whole task group is built/tested/committed) on the cumulative diff. **Decisions Q1–Q7 pending maintainer review.** |
+| [ADR-008](ADR-008-verification-gates.md) | Verification gates: adversarial review + verify-vs-spec before the PR | **ACCEPTED** | Bounded, B1-preserving gates via in-container `kiro-cli` (two passes), severity-gated draft routing, spec inputs added for Gate B (skip-with-notice if absent), default-off flags. **Q6 overridden → applies to BOTH the spec-executor (post-loop) AND the one-shot minion (post-fix).** Implementation in progress. |
 
 See [../ide-ingress.md](../ide-ingress.md) for the ingress spec, and
 [../verification-gates.md](../verification-gates.md) for the ADR-008 proposal

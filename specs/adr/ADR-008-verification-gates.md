@@ -1,10 +1,54 @@
 # ADR-008: Verification gates for the spec-executor (post-loop adversarial review + verify-vs-spec)
 
-**Status:** PROPOSED (needs your decisions)
+**Status:** ACCEPTED — recommendations taken for Q1–Q5 and Q7; **Q6 overridden
+by the maintainer to apply the gates to BOTH the spec-executor and the one-shot
+minion.** See "Accepted decisions" below.
 **Context doc:** [../verification-gates.md](../verification-gates.md)
 **Depends on:** [ADR-002](ADR-002-task-shape.md) (spec-executor exists),
 [ADR-003](ADR-003-results-channel.md), [ADR-005](ADR-005-payload-naming.md),
 [ADR-007](ADR-007-concurrency-and-cost-guardrails.md)
+
+## Accepted decisions (authoritative)
+
+| Q | Decision | Note |
+|---|----------|------|
+| **Q1** Review engine | **In-container `kiro-cli` review invocation(s)** | Reuse auth/redaction/RUNNER; worker owns the verdict format. |
+| **Q2** One pass or two | **Two distinct passes** — Gate A (adversarial review) then Gate B (verify-vs-spec) | Independent verdicts + independent enable flags. |
+| **Q3** Spec inputs / Gate B | **Extend payload/ingress with `requirements_md`/`design_md`** (repo-relative path, re-validated + clone-root-contained like `tasks_md_path`; or inline), **`.kiro/specs/<feature>/` sibling default**. **Absent spec → skip Gate B with notice** in the PR body (never block on a missing spec). | Gate A needs no new input. |
+| **Q4** Gate-failure routing | **Draft-PR-to-human.** A failing gate opens a DRAFT PR flagged with which gate(s) failed + findings; commits are kept/pushed. **No auto-remediation loop**, so **`SPEC_MAX_REVIEW_RETRIES` does NOT exist.** | Human / fresh planning session decides next. |
+| **Q5** Blocking vs advisory | **Severity-gated:** **high-severity** findings downgrade the PR to **draft**; **low-severity** are **advisory** (recorded in the PR body, PR stays non-draft). Applies to both gates. | The gate verdict schema must carry a severity per finding. |
+| **Q6** Scope | **OVERRIDDEN → BOTH.** Apply the gates to the **spec-executor** (post-loop phase on the cumulative diff) **AND** add a **post-fix review phase to the one-shot minion** (`task_type="one_shot"` / the Jira-SonarQube path) that runs the same gates on the one-shot change before its PR. | Maintainer chose both, not spec-executor-only. See "One-shot integration" below. |
+| **Q7** Rollout flags / budgets | Ship behind **`SPEC_REVIEW_ENABLED` / `SPEC_VERIFY_SPEC_ENABLED`**, **default OFF** (opt-in per deployment). Add **`SPEC_REVIEW_TIMEOUT_S`** per gate-pass bound; gate passes count toward `SPEC_JOB_TIMEOUT_S`. | Flag names are shared by both paths (see one-shot note for the one-shot wall-clock). |
+
+### One-shot integration (Q6 override)
+
+The one-shot minion (`runtime/agent.py` `run_pipeline`) produces a single change
+and opens one PR. With Q6 = BOTH, after its existing fix+test succeeds and before
+`step_open_pr`, it runs the SAME two gates on the one-shot change's cumulative
+diff:
+
+- **Gate A (adversarial review)** — input = the one-shot diff + the ticket
+  `description`/`summary` (the one-shot path's "intent"). No new input needed.
+- **Gate B (verify-vs-spec)** — the one-shot path has **no Kiro spec**
+  (`requirements.md`/`design.md`); by Q3's absent-spec rule, **Gate B is skipped
+  with a notice** on the one-shot path. (It becomes meaningful only if a future
+  one-shot source supplies acceptance criteria.) So in practice the one-shot path
+  gains **Gate A** now and Gate B is a documented no-op there until it has a spec.
+- **Routing/severity** identical (Q4/Q5): a high-severity Gate A finding
+  downgrades the one-shot PR to draft with findings; low-severity is advisory.
+- **Flags:** gated by the same `SPEC_REVIEW_ENABLED` (Gate A) /
+  `SPEC_VERIFY_SPEC_ENABLED` (Gate B) flags, default off, so the one-shot path is
+  byte-for-byte unchanged when the flags are off (preserving the existing
+  one-shot tests). The per-gate `SPEC_REVIEW_TIMEOUT_S` applies; the one-shot
+  path has no `SPEC_JOB_TIMEOUT_S`, so the gate timeout stands alone there.
+- **Shared implementation:** the gate logic (brief construction, kiro-cli review
+  invocation, verdict parse, severity routing, redaction) should live in ONE
+  reusable module invoked by both `run_pipeline` (one-shot) and
+  `run_spec_pipeline` (spec-executor), not duplicated.
+
+**B1 note:** on the one-shot path the gates are still a bounded, post-fix,
+code-orchestrated set of model passes before the PR — no outer loop is
+introduced, so B1 holds there too.
 
 ## Context
 
@@ -108,11 +152,12 @@ Both gates run post-loop on the cumulative diff. Do they run as:
   low-severity are advisory (recorded, PR stays non-draft). Applies to both gates.
 
 ### Q6 — Scope
-- **Spec-executor only (recommended v1).** The one-shot minion stays unchanged.
-  (A post-loop phase maps naturally only to the multi-task path; the one-shot
-  path is a single change and out of scope here.)
-- **Also add a post-fix review phase to the one-shot path** (reuse later; larger
-  blast radius).
+- Spec-executor only (was the recommendation). The one-shot minion stays
+  unchanged.
+- **Also add a post-fix review phase to the one-shot path — ✅ CHOSEN (maintainer
+  override).** Both paths get the gates (sharing one gate module); see "One-shot
+  integration" above. On the one-shot path Gate B is a documented skip-with-notice
+  until it has acceptance criteria, so it effectively gains Gate A now.
 
 ### Q7 — Budgets & rollout flags
 - `SPEC_REVIEW_ENABLED` / `SPEC_VERIFY_SPEC_ENABLED` flags to enable each gate
@@ -153,7 +198,9 @@ Both gates run post-loop on the cumulative diff. Do they run as:
 
 ## Status / next step
 
-PROPOSED. Record your choices for Q1–Q7 (edit this ADR to ACCEPTED with the
-selected options + a one-line rationale each), then a fresh session implements
-the post-loop review phase on top of `runtime/spec_agent.py` per
-[../verification-gates.md](../verification-gates.md).
+ACCEPTED (see "Accepted decisions"). Implementation proceeds: a shared gate
+module (in-container `kiro-cli` review + verify-vs-spec, severity-gated,
+redaction, draft/non-draft routing) invoked by the spec-executor's post-loop
+phase (`runtime/spec_agent.py`) AND by the one-shot minion before its PR
+(`runtime/agent.py`), both behind the default-off `SPEC_REVIEW_ENABLED` /
+`SPEC_VERIFY_SPEC_ENABLED` flags, per [../verification-gates.md](../verification-gates.md).
