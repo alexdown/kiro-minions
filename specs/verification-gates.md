@@ -23,8 +23,9 @@ deterministic · no model)**, and then opens the PR. It does **not** do:
 "Tests pass" is a weak proxy for "correct and matches intent." A task can go
 green while implementing the wrong thing, leaving a security hole, or satisfying
 only the tests the model itself wrote. This spec proposes adding the two missing
-gates **inside the worker, before the PR is opened (for the happy path) / before
-a task is accepted** — while staying faithful to the project's B1 principle.
+gates as a **post-loop review phase in the worker** — run once, after the whole
+task group is built, tested, and committed, and before the PR is opened (§3) —
+while staying faithful to the project's B1 principle.
 
 ---
 
@@ -44,67 +45,74 @@ them means **more model invocations** in the worker. That is compatible with B1
    gate, what to feed it, and how to route a pass/fail; the model only produces
    the review/verdict inside each bounded pass.
 
-If we keep both properties, the gates are "more bounded model steps inside a
-deterministic loop," not "an outer agent loop." That is the design constraint
-this spec commits to. **ADR-008 records it.**
+If we keep both properties, the gates are "a bounded, code-orchestrated review
+phase after a deterministic loop," not "an outer agent loop." That is the design
+constraint this spec commits to. **ADR-008 records it.** (Placement — outside the
+loop, once per group — is fixed in §3; boundedness is the constraint here.)
 
 ---
 
-## 3. Proposed gate placement
+## 3. Gate placement: a post-loop review phase (maintainer-directed)
 
-Two gates, at two different granularities:
+Both gates run **OUTSIDE the coding loop**, as a single **post-loop review
+phase** that executes **once per task group (spec)** — after every task has been
+built, tested, and committed. They are NOT interleaved per task.
+
+This keeps the coding loop (Phase 1) purely BUILD + deterministic test-VERIFY
+with no model-based gate inside it, and isolates all gate reasoning in one
+clearly bounded Phase 2 that runs on the **cumulative branch diff**. It is the
+cleaner B1 story (the loop stays deterministic end to end; the gates are a
+separate, bounded, code-orchestrated phase) and it reviews the whole change as
+one coherent unit rather than task-by-task fragments — so cross-task
+inconsistencies are visible.
 
 ```
-spec-executor per-task loop (extended):
-
+PHASE 1 — BUILD (coding loop, UNCHANGED from spec-executor.md §3):
   FOR each task:
-     BUILD    kiro-cli coding pass (fresh context)           [existing]
-     VERIFY   run repo tests (deterministic, no model)        [existing]
-       │ tests fail → retry (existing per-task budget)
-       ▼ tests pass
-     REVIEW   adversarial review of THIS task's diff          [NEW - gate A]
-              (fresh context, bounded)
-       │ findings (blocking) → back to BUILD (same task,
-       │                        bounded review-retry budget)
-       ▼ clean (or advisory-only)
-     COMMIT   one commit for this task                        [existing]
+     BUILD   kiro-cli coding pass (fresh context)            [existing]
+     VERIFY  run repo tests (deterministic, no model)         [existing]
+       tests fail → per-task retry budget ; still failing → blocker (stop)
+     COMMIT  one commit for this task                         [existing]
+  (stop-at-first-blocker still applies; a blocker ends Phase 1 early)
 
-  after ALL tasks complete (happy path only):
-     VERIFY-VS-SPEC  independent check of the cumulative       [NEW - gate B]
-                     diff vs requirements/design/tasks
-       │ pass  → open NON-draft PR                 (human = Gate 2)
-       ▼ fail  → open DRAFT PR flagged
-                 "spec-conformance failure" + findings  (human gate / re-plan)
+PHASE 2 — VERIFY GATES (NEW, runs ONCE, only if Phase 1 completed ALL tasks):
+     Gate A  adversarial review of the CUMULATIVE branch diff (fresh context)
+     Gate B  verify-vs-spec: cumulative diff vs requirements/design acceptance
+     → combine verdicts, then open ONE PR:
+          both pass (or advisory-only) → NON-draft PR         (human = Gate 2)
+          a gate fails (per Q5)        → DRAFT PR flagged with which gate(s)
+                                          failed + findings   (human gate)
 ```
 
-### Gate A — adversarial review (per task, after tests pass, before commit)
-- **Input:** this task's diff (`git diff` of the staged/working changes for the
-  task), the task's brief (title + body + requirement refs), and the minimal
-  spec context already assembled for the coding pass. **Fresh context** — the
-  reviewer does not see the coding pass's transcript, only the artifact (the
-  diff) and the intent (the task). This is the "06 REVIEW · fresh context" box.
-- **Output:** a structured verdict — `APPROVED` / `CHANGES_REQUESTED` — plus a
-  list of findings (severity + file/line + rationale).
-- **Routing:** `CHANGES_REQUESTED` (blocking findings) → back to **BUILD** for
-  the *same task*, feeding the findings into the next coding brief, bounded by a
-  new `SPEC_MAX_REVIEW_RETRIES` budget. Exhausting it = a **blocker**
-  (stop-at-first-blocker, draft PR, as today). `APPROVED` (or advisory-only
-  findings under the chosen policy) → proceed to commit.
+**If Phase 1 stops at a blocker** (not all tasks done), the gates do **not** run
+— there is no complete change to verify — and the draft PR is opened for the
+blocker exactly as today (see [spec-executor.md](spec-executor.md) §5).
 
-### Gate B — verify-vs-spec (once per spec, after all tasks, before the PR)
-- **Input:** the cumulative branch diff (base..fix branch), plus the **spec
-  acceptance criteria** — i.e. `requirements.md` and/or `design.md`, not just
-  `tasks.md`. (This requires the worker to have the spec; see §5 — a payload/
-  ingress change.) This is the "07 VERIFY VS SPEC · independent" box.
+### Gate A — adversarial review (post-loop, on the cumulative diff)
+- **Input:** the cumulative branch diff (`base..fix` branch), the job `summary`,
+  and the `tasks.md` (intent). **Fresh context** — the reviewer sees only the
+  artifact (the diff) and the intent, never the coding passes' transcripts. This
+  is the "06 REVIEW · fresh context" box, applied to the whole change.
+- **Output:** a structured verdict — `APPROVED` / `CHANGES_REQUESTED` — plus
+  findings (severity + file/line + rationale).
+
+### Gate B — verify-vs-spec (post-loop, on the cumulative diff)
+- **Input:** the cumulative branch diff, plus the **spec acceptance criteria** —
+  `requirements.md` and/or `design.md`, not just `tasks.md` (requires the worker
+  to have the spec; see §5 — a payload/ingress change). This is the "07 VERIFY
+  VS SPEC · independent" box.
 - **Output:** a structured verdict — `SATISFIES_SPEC` / `DOES_NOT_SATISFY` +
   findings mapping unmet requirements to evidence.
-- **Routing:** `SATISFIES_SPEC` → open the normal **non-draft** PR; the human is
-  Gate 2 ("ship it on green gates"). `DOES_NOT_SATISFY` → open a **draft** PR
-  flagged as a spec-conformance failure with the findings. We have **no
-  autonomous planner in the container**, so the diagram's "fail → back to the
-  planner" becomes a **human gate** by default (the human / a fresh planning
-  session re-plans). An autonomous re-plan loop is a much larger, separate option
-  (ADR-008 Q4).
+
+### Combined routing (post-loop)
+The deterministic phase combines both verdicts and decides the PR mode:
+- **both pass** (or only advisory findings, per Q5) → open a **non-draft** PR;
+  the human is Gate 2 ("ship it on green gates").
+- **either fails** (per Q5's blocking policy) → open a **draft** PR flagged with
+  which gate(s) failed + the findings. The task commits are kept and pushed
+  regardless, so no work is lost. We have **no autonomous planner in the
+  container**, so the diagram's "fail → back to the planner" is a **human gate**
+  by default; an optional bounded auto-remediation pass is ADR-008 Q4.
 
 ---
 
@@ -152,28 +160,29 @@ we must give the worker the spec. Proposed, consistent with the existing
   *block* on a missing spec, but we're honest that the gate didn't run). See
   ADR-008 Q3.
 
-Gate A needs no new inputs (it works from the task's diff + the task brief it
-already has).
+Gate A needs no new inputs (it works from the cumulative branch diff + the
+`tasks.md`/`summary` already present).
 
 ---
 
 ## 6. Status, PR body, and budgets
 
-- **Phases (ADR-003):** extend the per-task phase beyond `task N/total` to name
-  the gate in flight, e.g. `task 7/20: reviewing` and a spec-level
-  `verifying-spec`, so the polling API shows where a long job is.
-- **PR body:** add a "Verification" section — per-task review outcomes (and any
-  advisory findings carried forward) and the spec-verification verdict. A draft
-  PR caused by a gate failure states WHICH gate failed and the findings
-  (redacted).
+- **Phases (ADR-003):** after the per-task `task N/total` phases of Phase 1, the
+  post-loop phase writes gate phases, e.g. `reviewing` (Gate A) and
+  `verifying-spec` (Gate B), so the polling API shows where a long job is.
+- **PR body:** add a "Verification" section — the Gate A review verdict + any
+  advisory findings, and the Gate B spec-verification verdict. A draft PR caused
+  by a gate failure states WHICH gate(s) failed and the findings (redacted).
 - **Budgets (ADR-007 family):** new, env-configurable like the existing
   `SPEC_*` vars:
-  - `SPEC_MAX_REVIEW_RETRIES` (default TBD, e.g. `2`) — max BUILD↔REVIEW cycles
-    per task before a review failure becomes a blocker.
-  - `SPEC_REVIEW_ENABLED` / `SPEC_VERIFY_SPEC_ENABLED` — feature flags so the
-    gates can be rolled out / disabled per deployment.
-  - review/verify passes count toward the per-task and per-job model-call cost;
-    `SPEC_JOB_TIMEOUT_S` still bounds overall wall-clock.
+  - `SPEC_REVIEW_ENABLED` / `SPEC_VERIFY_SPEC_ENABLED` — feature flags so each
+    gate can be rolled out / disabled per deployment (ADR-008 Q7).
+  - `SPEC_REVIEW_TIMEOUT_S` — per gate-pass timeout; gate passes count toward the
+    overall `SPEC_JOB_TIMEOUT_S` wall-clock budget.
+  - `SPEC_MAX_REVIEW_RETRIES` — **only exists if** ADR-008 Q4 chooses the
+    optional bounded auto-remediation path (max post-loop BUILD→re-gate cycles
+    before downgrading to a draft PR). With the recommended draft-PR-to-human
+    routing there is no review-retry loop and this var is not needed.
 - **Secret safety:** every review/verify brief, finding, verdict, and PR line is
   routed through `redact()` and delivered on STDIN, exactly like the coding
   brief. No diff or finding may leak a secret into argv/logs/PR.
@@ -182,40 +191,48 @@ already has).
 
 ## 7. What this is NOT (scope guards)
 
-- Not an open-ended agent loop — both gates are bounded (§2).
+- Not inside the coding loop — both gates run **once, post-loop**, on the
+  cumulative diff (§3); the Phase 1 coding loop is unchanged.
+- Not an open-ended agent loop — the gate phase is bounded (§2): a fixed set of
+  gate passes, no "review until happy."
 - Not a replacement for the human gate — the human still approves the PR
   ("Gate 2 · ship it on green gates"); these gates make the PR *trustworthy*
   before it reaches the human.
-- Not a re-plan engine by default — a spec-conformance failure escalates to a
-  human/draft PR; an autonomous "back to the planner" loop is an explicit,
-  larger option (ADR-008 Q4), out of scope unless you choose it.
+- Not a re-plan engine by default — a gate failure opens a draft PR for a human;
+  an autonomous bounded auto-remediation pass is an explicit, larger option
+  (ADR-008 Q4), out of scope unless you choose it.
 - Not applied to the one-shot minion — this is a spec-executor enhancement; the
-  `task_type="one_shot"` path is unchanged (though Gate A *could* be reused there
-  later; ADR-008 Q6).
+  `task_type="one_shot"` path is unchanged (a post-fix review phase *could* be
+  added there later; ADR-008 Q6).
 
 ---
 
 ## 8. Decisions I need from you
 
+Both gates run **post-loop, once per spec** (§3, maintainer-directed), so there
+is no per-task-vs-per-spec granularity question and no in-loop review retry.
 Recorded in [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md):
 
-- **Q1 — Review engine:** in-container `kiro-cli` (Option 1), sub-agent reviewer
-  (Option 2), or a different/stronger review model (Option 3)?
-- **Q2 — Review granularity:** Gate A **per task** (tighter, catches issues
-  before they compound, more model calls) vs **once per spec** at the end
-  (cheaper, coarser)? (Recommendation: per task.)
+- **Q1 — Review engine:** in-container `kiro-cli` (Option 1, recommended),
+  sub-agent reviewer (Option 2), or a different/stronger review model (Option 3)?
+- **Q2 — One gate pass or two:** two distinct passes, Gate A then Gate B
+  (recommended, clearer findings + independent flags), or one combined
+  review+conformance pass (cheaper, muddier)?
 - **Q3 — Spec inputs & Gate B:** OK to extend the payload/ingress with
-  `requirements_md`/`design_md` (path or inline)? And if the spec is absent,
-  skip-with-notice (recommended) vs block?
-- **Q4 — Verify-vs-spec failure routing:** draft-PR-to-human (recommended; fits
-  no-planner-in-container) vs an autonomous re-plan loop (much larger)?
-- **Q5 — Blocking vs advisory:** are Gate A findings **blocking** (must fix to
-  proceed) or **advisory** (recorded in the PR, don't stop the task)? Possibly
-  severity-gated (e.g. high = block, low = advisory).
-- **Q6 — Scope:** spec-executor only (recommended v1), or also wire Gate A into
-  the one-shot minion?
-- **Q7 — Budgets/flags defaults:** `SPEC_MAX_REVIEW_RETRIES` default; ship the
-  gates behind `*_ENABLED` flags defaulting off (safe rollout) or on?
+  `requirements_md`/`design_md` (path or inline, `.kiro/specs/<feature>/`
+  sibling default)? And if the spec is absent, skip-with-notice (recommended) vs
+  block?
+- **Q4 — Gate failure routing:** draft-PR-to-human (recommended; fits
+  no-planner-in-container) vs an optional bounded post-loop auto-remediation pass
+  (larger; adds `SPEC_MAX_REVIEW_RETRIES`)?
+- **Q5 — Blocking vs advisory findings:** blocking (a failing gate ⇒ draft PR),
+  advisory (findings recorded, PR stays non-draft), or **severity-gated**
+  (recommended: high ⇒ draft, low ⇒ advisory)?
+- **Q6 — Scope:** spec-executor only (recommended v1), or also add a post-fix
+  review phase to the one-shot minion?
+- **Q7 — Rollout flags/budgets:** ship behind `SPEC_REVIEW_ENABLED` /
+  `SPEC_VERIFY_SPEC_ENABLED` defaulting **off** (recommended) or on; and a
+  `SPEC_REVIEW_TIMEOUT_S` per-gate bound.
 
 Nothing is built yet. Once you record the decisions in ADR-008, a fresh session
-implements the gates on top of the spec-executor.
+implements the post-loop review phase on top of the spec-executor.
