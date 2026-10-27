@@ -459,6 +459,147 @@ def test_read_spec_acceptance_absent_returns_none(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _read_acceptance_doc guards (ADR-008 v1-cleanup read-site hardening).
+#
+# These PIN the two guards added inside ``_read_acceptance_doc`` that had no
+# dedicated test (v2 review open finding): the ``.md``-only suffix restriction
+# and the ``SPEC_ACCEPTANCE_MAX_BYTES`` bounded read. Without coverage a future
+# refactor could silently drop either guard with CI staying green.
+# ---------------------------------------------------------------------------
+
+
+# (g) A clone-contained NON-.md explicit requirements_md_path is SKIPPED (the
+# .md restriction is enforced) and — with no other acceptance source — Gate B
+# ends up skip-with-notice: it never issues a verify kiro call and the notice
+# text appears in the PR body, while Gate A (clean) keeps the PR non-draft.
+def test_requirements_md_path_non_md_skipped_gate_b_notice(gates_on, monkeypatch):
+    mod = gates_on
+    # A clone-contained, traversal-safe, NON-.md file (requirements.txt). It is
+    # a real regular file, so only the .md suffix guard can cause the skip.
+    _make_workdir(mod, monkeypatch, spec_files={
+        "requirements.txt": "Requirement 1: greet the user (NON-md source).",
+    })
+    runner = FakeRunner(results=_three_tasks_pass_results(
+        [GATE_A_CLEAN],  # Gate B skipped (no acceptance), so no verify pass.
+        pr_url="https://github.com/o/r/pull/17",
+    ))
+    agent.RUNNER = runner
+
+    result = mod.run_spec_pipeline(_payload(
+        requirements_md_path="requirements.txt",
+    ))
+
+    # .md restriction enforced: the non-.md file is NOT read as acceptance text,
+    # so Gate B has nothing to verify and is skipped-with-notice (never blocks).
+    assert result["status"] == "success"
+    assert result["draft"] is False
+    gh = runner.find("gh pr create")
+    assert "--draft" not in gh.cmd
+    body = gh.cmd[gh.cmd.index("--body") + 1]
+    assert "## Verification" in body
+    assert "APPROVED" in body
+    assert "Spec verification did not run" in body
+    # No Gate B verify kiro call happened: only Gate A invoked kiro (on top of
+    # the 3 per-task coding passes).
+    review_calls = _kiro_review_calls(runner)
+    assert len(review_calls) == 1
+    assert all("INDEPENDENT verifier" not in c.input for c in review_calls)
+    # Belt-and-braces: the non-.md content never reached any brief.
+    assert runner.count("kiro-cli chat") == 4
+
+
+# (h) An acceptance .md file whose size EXCEEDS SPEC_ACCEPTANCE_MAX_BYTES is read
+# only up to the bound. Monkeypatch the cap to a small value and reload so the
+# module-level cap picks it up; write a larger .md; then inspect the Gate B
+# verify kiro call's STDIN and assert the acceptance text is truncated to the
+# cap. Reload back in the fixture teardown so the cap never leaks.
+@pytest.fixture
+def small_acceptance_cap(gates_on, monkeypatch):
+    """Reload spec_agent with a tiny SPEC_ACCEPTANCE_MAX_BYTES (on top of the
+    flags-ON gates_on state). Yields (reloaded_module, cap). Teardown restores
+    the env and reloads spec_agent so the cap does not leak to other tests."""
+    cap = 32
+    monkeypatch.setenv("SPEC_ACCEPTANCE_MAX_BYTES", str(cap))
+    reloaded = importlib.reload(spec_agent)
+    try:
+        assert reloaded.SPEC_ACCEPTANCE_MAX_BYTES == cap
+        yield reloaded, cap
+    finally:
+        monkeypatch.delenv("SPEC_ACCEPTANCE_MAX_BYTES", raising=False)
+        importlib.reload(spec_agent)
+
+
+def test_oversized_acceptance_md_read_is_bounded(small_acceptance_cap,
+                                                 monkeypatch):
+    mod, cap = small_acceptance_cap
+    # A .md acceptance doc much larger than the cap, with a unique sentinel at
+    # the very start (inside the cap) and a distinct sentinel past the cap.
+    head = "REQ-HEAD "  # 9 bytes, inside the 32-byte cap
+    tail = " REQ-TAIL-PAST-CAP"
+    big_md = head + ("x" * 200) + tail
+    assert len(big_md) > cap
+    _make_workdir(mod, monkeypatch, spec_files={
+        "docs/requirements.md": big_md,
+    })
+    runner = FakeRunner(results=_three_tasks_pass_results(
+        [GATE_A_CLEAN, GATE_B_SATISFIES],
+        pr_url="https://github.com/o/r/pull/18",
+    ))
+    agent.RUNNER = runner
+
+    result = mod.run_spec_pipeline(_payload(
+        requirements_md_path="docs/requirements.md",
+    ))
+    assert result["status"] == "success"
+
+    # Gate B ran (acceptance resolved); inspect the verify brief it received.
+    verify = [c for c in _kiro_review_calls(runner)
+              if "INDEPENDENT verifier" in c.input][0]
+    # Only the first `cap` bytes were read: the in-cap head is present, the
+    # past-cap tail sentinel is NOT. (The brief wraps the acceptance text, so we
+    # assert on substring presence/absence rather than exact length.)
+    assert "REQ-HEAD" in verify.input
+    assert "REQ-TAIL-PAST-CAP" not in verify.input
+    # Prove the bound is what truncated it: exactly `cap` bytes of the doc were
+    # read, so at most the first `cap` chars of the (ASCII) body survive.
+    assert big_md[:cap] in verify.input
+    assert big_md[:cap + 1] not in verify.input
+
+
+# (i) A .is_file() miss (path resolves to a directory, or to a missing file) is
+# skipped gracefully by _read_acceptance_doc (returns None, never reads).
+def test_read_acceptance_doc_is_file_miss_returns_none(monkeypatch):
+    repo = Path(tempfile.mkdtemp(prefix="kmgate-isfile-"))
+    (repo / "adir.md").mkdir()  # a directory whose name even ends in .md
+    dir_target = spec_agent._resolve_contained_file(
+        repo, "adir.md", field="requirements_md_path",
+    )
+    assert spec_agent._read_acceptance_doc(dir_target) is None
+
+    missing_target = spec_agent._resolve_contained_file(
+        repo, "missing.md", field="requirements_md_path",
+    )
+    assert spec_agent._read_acceptance_doc(missing_target) is None
+
+
+# (j) Unit-level: a non-.md regular file is skipped by _read_acceptance_doc even
+# though it exists and is readable (direct pin of the suffix guard, independent
+# of the full-pipeline path in test (g)).
+def test_read_acceptance_doc_non_md_suffix_returns_none(monkeypatch):
+    repo = Path(tempfile.mkdtemp(prefix="kmgate-suffix-"))
+    (repo / "requirements.txt").write_text("Requirement 1: greet.")
+    (repo / "DESIGN.rst").write_text("Design notes.")
+    txt_target = spec_agent._resolve_contained_file(
+        repo, "requirements.txt", field="requirements_md_path",
+    )
+    rst_target = spec_agent._resolve_contained_file(
+        repo, "DESIGN.rst", field="design_md_path",
+    )
+    assert spec_agent._read_acceptance_doc(txt_target) is None
+    assert spec_agent._read_acceptance_doc(rst_target) is None
+
+
+# ---------------------------------------------------------------------------
 # Secret hygiene with gates ON
 # ---------------------------------------------------------------------------
 
