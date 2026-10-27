@@ -106,9 +106,12 @@ REPO_ALLOWLIST = _parse_allowlist(os.environ.get("REPO_ALLOWLIST", ""))
 
 # Per-actor dispatch quota (ADR-007 C). Limits how many IDE tasks a single
 # developer identity (``actor`` from the verified JWT claims) can dispatch per
-# rolling window, so one developer or a buggy extension cannot flood the
-# pipeline (scaled parallelism = scaled cost + blast radius). Enforced in
-# ``handler_ide`` BEFORE any claim/enqueue via a DynamoDB-backed atomic counter.
+# FIXED window (a tumbling window that resets at each boundary — see
+# ``_quota_window_start``), so one developer or a buggy extension cannot flood
+# the pipeline (scaled parallelism = scaled cost + blast radius). Enforced in
+# ``handler_ide`` after a successful idempotency claim and BEFORE any enqueue,
+# via a DynamoDB-backed atomic counter (so idempotent retries do not consume a
+# slot — review finding #1).
 #
 #   ACTOR_QUOTA_MAX            — max dispatches per actor per window.
 #                                0 / unset => UNLIMITED (quota disabled), which
@@ -504,8 +507,46 @@ def _audit(outcome: str, *, source: str, actor: str = "", task_id: str = "",
 # ---------------------------------------------------------------------------
 
 
+# Structured marker emitted whenever the per-actor quota FAILS OPEN (ADR-007 C,
+# review finding #2). It is a distinct, machine-greppable JSON line (not the
+# generic redacted print) so a CloudWatch metric filter / alarm can fire on it:
+# the quota exists specifically to bound scaled cost/blast radius, so the moment
+# it silently stops enforcing is exactly when an operator wants a signal. The
+# ``reason`` disambiguates a backend error from an unreadable counter read.
+QUOTA_FAIL_OPEN_EVENT = "quota_fail_open"
+
+
+def _emit_quota_fail_open(actor: str, reason: str) -> None:
+    """Emit one structured, greppable, redacted quota fail-open signal.
+
+    Best-effort: never raises (a logging failure must not wedge dispatch). The
+    distinct ``event`` key lets a CloudWatch metric filter count these and alarm
+    so fail-open is OBSERVABLE, not buried in a generic log line. Carries no
+    secret (actor + reason are routed through redact()).
+    """
+    record = {
+        "event": QUOTA_FAIL_OPEN_EVENT,
+        "ts": int(time.time()),
+        "actor": redact(actor) or "",
+        "reason": redact(reason) or "",
+    }
+    try:
+        print(json.dumps(record))
+    except Exception:  # noqa: BLE001 - observability must never break dispatch
+        pass
+
+
 def _quota_window_start(now: int) -> int:
-    """Return the start timestamp of the fixed quota window containing ``now``."""
+    """Return the start timestamp of the FIXED quota window containing ``now``.
+
+    This is a FIXED (tumbling) window, not a rolling/sliding one: ``now //
+    window`` buckets time into contiguous fixed windows and the per-actor
+    allowance resets hard at each window boundary. (A rolling window would
+    instead count dispatches in the trailing ``window`` seconds from ``now``.)
+    Fixed is intentional for v1 — it is a single atomic counter per
+    actor+window, cheap and race-free; a sliding window would need per-dispatch
+    timestamps and a range read.
+    """
     window = ACTOR_QUOTA_WINDOW_SECONDS if ACTOR_QUOTA_WINDOW_SECONDS > 0 else 1
     return (now // window) * window
 
@@ -515,15 +556,18 @@ def _check_actor_quota(actor: str) -> bool:
 
     Returns True when the dispatch is WITHIN the quota (or the quota is
     disabled), False when the actor has EXCEEDED the limit for the current
-    window (caller returns 429 before any claim/enqueue).
+    window (caller returns 429 before any enqueue).
 
     Implementation: an atomic ``UpdateItem ADD`` on a dedicated counter item
     keyed by ``quota#<actor>#<window_start>`` on the physical ``sonar_hash``
-    attribute of the JobsTable, with a TTL so expired windows are swept. The ADD
-    returns the post-increment value (ReturnValues=UPDATED_NEW); if it exceeds
-    ACTOR_QUOTA_MAX the actor is over the limit. A backend error is fail-OPEN
-    (returns True) so a transient DynamoDB blip cannot wedge the ingress path;
-    the error is logged redacted and carries no secret.
+    attribute of the JobsTable, with a TTL so expired FIXED windows are swept.
+    The ADD returns the post-increment value (ReturnValues=UPDATED_NEW); if it
+    exceeds ACTOR_QUOTA_MAX the actor is over the limit. A backend error is
+    fail-OPEN (returns True) so a transient DynamoDB blip cannot wedge the
+    ingress path; the fail-open is emitted as a distinct, greppable signal
+    (``_emit_quota_fail_open``) so an operator can alarm on a sustained fault
+    that silently removes the abuse ceiling (finding #2). The signal carries no
+    secret (routed through redact()).
     """
     if ACTOR_QUOTA_MAX <= 0:
         # Quota disabled / unlimited.
@@ -545,13 +589,15 @@ def _check_actor_quota(actor: str) -> bool:
             ReturnValues="UPDATED_NEW",
         )
     except ClientError as exc:
-        # Fail open: a counter-backend error must not wedge the request path.
-        print(redact(f"actor quota counter error (fail-open): {exc}"))
+        # Fail open: a counter-backend error must not wedge the request path,
+        # but emit an observable signal so the lost ceiling can be alarmed on.
+        _emit_quota_fail_open(actor, f"counter backend error: {exc}")
         return True
 
     count = (resp or {}).get("Attributes", {}).get("count")
     if count is None:
-        # Could not read back the post-increment value -> fail open.
+        # Could not read back the post-increment value -> fail open (observable).
+        _emit_quota_fail_open(actor, "counter post-increment value unreadable")
         return True
     return count <= ACTOR_QUOTA_MAX
 
@@ -882,7 +928,12 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
       3. Enforce the repo allowlist (403) BEFORE any claim/enqueue, matching the
          Jira path ordering.
       4. Derive the logical task_id (already done by the parser) and claim it on
-         the existing table (200 skipped if blocked).
+         the existing table (200 skipped if blocked — a skipped claim is an
+         idempotent retry and does NOT consume quota).
+      4b. Only on a SUCCESSFUL (new) claim, count the dispatch against the
+         per-actor quota (429 over the limit, releasing the claim). Quota runs
+         after the claim so idempotent retries never erode it (finding #1), but
+         still strictly before any enqueue of genuinely new work.
       5. Build the TaskPayload (source="kiro-ide", actor set) and enqueue onto
          the existing SQS JobsQueue; on enqueue failure mark failed + redacted
          500.
@@ -928,22 +979,12 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
             {"error": redact(f"repo not in allowlist: {repo_clone_url}")},
         )
 
-    # --- Per-actor dispatch quota (ADR-007 C), BEFORE any claim/enqueue ---
-    # Count this dispatch against the actor's rolling window. Over the limit ->
-    # 429 with a redacted reason and NO claim / NO enqueue. The quota is a
-    # fairness/abuse guardrail for scaled parallelism; it is disabled when
-    # ACTOR_QUOTA_MAX is 0/unset.
-    if not _check_actor_quota(actor):
-        _audit(AUDIT_QUOTA_EXCEEDED, source="kiro-ide", actor=actor,
-               task_id=task_id, repo=repo_clone_url,
-               reason="per-actor dispatch quota exceeded")
-        return _response(
-            429,
-            {"error": redact("per-actor dispatch quota exceeded"),
-             "task_id": task_id},
-        )
-
     # --- Idempotency claim (logical task_id -> physical sonar_hash attr) ---
+    # The claim runs BEFORE the quota check (review finding #1): an idempotent
+    # re-dispatch of an already-claimed/done task_id returns 200 "skipped" with
+    # NO new work enqueued, so it must NOT consume a quota slot. Only a
+    # SUCCESSFUL claim (genuinely new work) is counted against the quota below,
+    # which still gates strictly before any enqueue.
     try:
         claimed = _claim_job(
             task_id, task_id, extra={"source": "kiro-ide", "actor": actor}
@@ -954,6 +995,9 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
         return _response(500, {"error": redact(f"dynamodb error: {exc}")})
 
     if not claimed:
+        # Skipped claim: no new work, no quota consumed. This is the idempotent
+        # retry path (double-click / dropped 202) — returning 429 here would
+        # wrongly block a user from retrying the SAME task they already queued.
         _audit(AUDIT_SKIPPED, source="kiro-ide", actor=actor, task_id=task_id,
                repo=repo_clone_url,
                reason="task already in_flight or done")
@@ -964,6 +1008,26 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
                 "reason": "task already in_flight or done for this task_id",
                 "task_id": task_id,
             },
+        )
+
+    # --- Per-actor dispatch quota (ADR-007 C), AFTER a successful claim and
+    # BEFORE any enqueue ---
+    # Count this NEW dispatch against the actor's fixed (tumbling) window. Over
+    # the limit -> 429 with a redacted reason and NO enqueue. Because this runs only after
+    # a fresh claim, idempotent retries of an existing task_id never erode the
+    # quota (finding #1). Over the limit we release the just-made claim (mark it
+    # failed) so the task_id stays retryable rather than wedged in_flight. The
+    # quota is disabled when ACTOR_QUOTA_MAX is 0/unset.
+    if not _check_actor_quota(actor):
+        _mark_status(task_id, STATUS_FAILED,
+                     {"reason": redact("per-actor dispatch quota exceeded")})
+        _audit(AUDIT_QUOTA_EXCEEDED, source="kiro-ide", actor=actor,
+               task_id=task_id, repo=repo_clone_url,
+               reason="per-actor dispatch quota exceeded")
+        return _response(
+            429,
+            {"error": redact("per-actor dispatch quota exceeded"),
+             "task_id": task_id},
         )
 
     # --- Build the TaskPayload and enqueue for the consumer ---
@@ -1075,6 +1139,21 @@ def status_handler(event, context):  # noqa: ANN001 - Lambda signature
     item = (result or {}).get("Item")
     if not item:
         return _response(404, {"error": "task not found", "task_id": task_id})
+
+    # --- Per-actor ownership scoping for IDE-sourced tasks (finding #3) ---
+    # An IDE task row records the dispatching ``actor``; a verified identity may
+    # only read its OWN IDE tasks. This closes the "any verified identity can
+    # read any task_id" gap without relying solely on task_ids being
+    # unguessable. We return 404 (not 403) so the endpoint does not confirm the
+    # existence of another tenant's task_id. Jira-sourced rows (source != kiro-
+    # ide, actor empty) stay readable by any verified identity — the Jira path
+    # has no per-developer owner, so this preserves its existing behaviour.
+    if item.get("source") == "kiro-ide":
+        owner = item.get("actor") or ""
+        if owner and owner != actor:
+            return _response(
+                404, {"error": "task not found", "task_id": task_id}
+            )
 
     status = item.get("status", "")
     body: dict = {"task_id": task_id, "status": status}

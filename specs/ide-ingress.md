@@ -163,6 +163,14 @@ runtime don't change. Proposed generalisation (names TBD — ADR-005):
 - `sonar_hash` (Jira-only) becomes an optional `source`-specific field; the
   generic idempotency key is `task_id` (ADR-004). The DynamoDB key rename has
   migration implications — see ADR-004.
+- A caller MAY supply an optional `idempotency_key` to override the derived
+  `task_id`. Because this value becomes the physical `sonar_hash` partition key
+  on a table shared with the Jira path and the per-actor `quota#…` counters, it
+  is **constrained**: it is forced into the `ide-` namespace and must match
+  `^[A-Za-z0-9._-]{1,128}$` (after an optional leading `ide-`). This rejects
+  `#` (so it cannot land in the `quota#…` namespace), whitespace, and overlong
+  values — a client can neither collide with a Jira hash / quota counter nor
+  target another tenant's row via the status API's by-key read.
 - The runtime needs **no change** if we keep `description` as the kiro-cli brief
   and `acceptance=tests_pass`.
 
@@ -177,6 +185,11 @@ expects feedback. Options (ADR-003):
   current status row from DynamoDB (`queued` / `in_flight` / `done`+`pr_url` /
   `failed` / `tests_failed` + a redacted reason). The extension polls every few
   seconds. Simplest, stateless, cheap, reuses the status row we already write.
+  The endpoint is read-only and scopes IDE-sourced rows to their owner: a
+  verified identity may only read its OWN IDE tasks (the row records the
+  dispatching `actor`); another identity gets `404` (existence is not leaked).
+  Jira-sourced rows have no per-developer owner and stay readable by any
+  verified identity.
 - **Option B — Streaming (WebSocket / SSE via API Gateway).** Near-real-time
   milestones ("cloning", "running tests", "PR opened"). Better UX, more moving
   parts (connection state, fan-out, auth on the socket).

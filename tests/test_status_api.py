@@ -165,6 +165,69 @@ def test_status_empty_claims_returns_401(handler, jobs_table):
 
 
 # ---------------------------------------------------------------------------
+# Per-actor ownership scoping for IDE tasks (finding #3)
+# ---------------------------------------------------------------------------
+
+
+def test_status_owner_can_read_own_ide_task(handler, jobs_table):
+    _seed(jobs_table, TASK_ID, status="in_flight", phase="cloning",
+          source="kiro-ide", actor="dev-123")
+    resp = handler.status_handler(
+        _status_event(TASK_ID, claims={"sub": "dev-123"}), None
+    )
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["status"] == "in_flight"
+
+
+def test_status_other_actor_cannot_read_ide_task(handler, jobs_table):
+    # dev-123 dispatched this IDE task; a DIFFERENT verified identity must not
+    # be able to read it. We return 404 (not 403) so existence is not leaked.
+    _seed(jobs_table, TASK_ID, status="in_flight", phase="cloning",
+          source="kiro-ide", actor="dev-123")
+    resp = handler.status_handler(
+        _status_event(TASK_ID, claims={"sub": "dev-999"}), None
+    )
+    assert resp["statusCode"] == 404
+    assert json.loads(resp["body"])["error"] == "task not found"
+
+
+def test_status_jira_task_readable_by_any_identity(handler, jobs_table):
+    # A Jira-sourced row has no per-developer owner (actor empty), so it stays
+    # readable by any verified identity — preserving existing behaviour.
+    _seed(jobs_table, "jira-hash-1", status="done", phase="done",
+          source="jira", actor="", pr_url="https://github.com/o/r/pull/3")
+    resp = handler.status_handler(
+        _status_event("jira-hash-1", claims={"sub": "anyone"}), None
+    )
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["pr_url"] == "https://github.com/o/r/pull/3"
+
+
+def test_status_end_to_end_owner_scoping_via_ide_dispatch(handler, jobs_table):
+    # Dispatch a real IDE task as dev-123, then confirm another actor is scoped
+    # out when polling it (drives the full handler_ide -> status_handler path).
+    body = {
+        "repo_clone_url": "https://github.com/your-org/your-repo.git",
+        "description": "Add input validation.",
+        "summary": "Validate input",
+        "idempotency_key": "owned-task",
+    }
+    dispatch = make_ide_jwt_event(body, {"sub": "dev-123"})
+    resp = handler.handler_ide(dispatch, None)
+    assert resp["statusCode"] == 202
+    task_id = json.loads(resp["body"])["task_id"]
+
+    # Owner reads it fine.
+    assert handler.status_handler(
+        _status_event(task_id, claims={"sub": "dev-123"}), None
+    )["statusCode"] == 200
+    # A different actor is scoped out (404).
+    assert handler.status_handler(
+        _status_event(task_id, claims={"sub": "intruder"}), None
+    )["statusCode"] == 404
+
+
+# ---------------------------------------------------------------------------
 # Secret redaction: a reason embedding a token is masked
 # ---------------------------------------------------------------------------
 

@@ -249,9 +249,70 @@ def has_sonarqube_label(labels: list[str]) -> bool:
 # v1 acceptance is fixed to "tests pass" (ADR-002). Future: lint, typecheck, …
 IDE_ACCEPTANCE = "tests_pass"
 
+# Every IDE task_id — derived OR client-supplied — carries this prefix so it
+# lives in its own namespace on the table shared with the Jira path (where the
+# physical ``sonar_hash`` attribute holds a SonarQube hash) and the per-actor
+# quota counters (``quota#<actor>#<window>``). A client ``idempotency_key`` is
+# constrained to this namespace (see ``_normalise_idempotency_key``) so a caller
+# can never supply a value that collides with a Jira hash or a ``quota#`` counter
+# item, and can never read/wedge another tenant's row via the partition key.
+IDE_TASK_ID_PREFIX = "ide-"
+
+# Reserved physical-key prefixes a client override must never be allowed to
+# reach, even after the ``ide-`` prefix is enforced. ``quota#`` is the per-actor
+# counter namespace; listing it here documents the collision the normalisation
+# prevents and fails closed if the prefix rule is ever loosened.
+_RESERVED_KEY_PREFIXES = ("quota#",)
+
+# A client-supplied idempotency key (the part AFTER the enforced ``ide-``
+# prefix) must be a bounded, conservative token so the resulting partition key
+# stays within a safe charset and length. No ``#`` (keeps it out of the
+# ``quota#`` namespace), no path/space/control characters.
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
 
 class IdeRequestError(ValueError):
     """Raised when an IDE task request is missing/invalid (maps to HTTP 400)."""
+
+
+def _normalise_idempotency_key(raw: str) -> str:
+    """Validate a client idempotency key and return the namespaced task_id.
+
+    The returned value is ALWAYS within the ``ide-`` namespace so a client
+    override can never collide with a Jira ``sonar_hash`` or a ``quota#<actor>#
+    <window>`` counter item on the shared table, and can never be used to read
+    or wedge another tenant's row via the status API's by-partition-key read
+    (review finding #3).
+
+    Rules (raises ``IdeRequestError`` on any violation):
+      * must be a non-empty string;
+      * a leading ``ide-`` is accepted (idempotent) but not required — the
+        prefix is enforced on the returned value either way;
+      * the remainder (after any ``ide-``) must match
+        ``^[A-Za-z0-9._-]{1,128}$`` — bounded length, conservative charset, no
+        ``#`` (so it cannot enter the ``quota#`` namespace), no whitespace, no
+        path separators beyond ``.-_``;
+      * the final value must not begin with a reserved prefix (e.g. ``quota#``);
+        this is belt-and-braces since the charset already excludes ``#``.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise IdeRequestError("field idempotency_key must be a non-empty string")
+    key = raw.strip()
+    # Accept (but do not require) a caller-supplied ``ide-`` prefix so a client
+    # that echoes a previously-returned task_id stays idempotent.
+    body = key[len(IDE_TASK_ID_PREFIX):] if key.startswith(IDE_TASK_ID_PREFIX) else key
+    if not _IDEMPOTENCY_KEY_RE.match(body):
+        raise IdeRequestError(
+            "field idempotency_key must match "
+            "^[A-Za-z0-9._-]{1,128}$ (optionally prefixed 'ide-')"
+        )
+    task_id = f"{IDE_TASK_ID_PREFIX}{body}"
+    for reserved in _RESERVED_KEY_PREFIXES:
+        if task_id.startswith(reserved):
+            raise IdeRequestError(
+                f"field idempotency_key must not use the reserved '{reserved}' namespace"
+            )
+    return task_id
 
 
 def derive_task_id(actor: str, repo_clone_url: str, base_branch: str,
@@ -333,12 +394,13 @@ def parse_ide_request(body: dict, actor: str) -> dict:
         raise IdeRequestError("field file_to_fix must be a string")
 
     # Derive a stable logical task_id (ADR-004). A client-supplied idempotency
-    # key, if present, overrides the server derivation.
+    # key, if present, overrides the server derivation — but it is constrained
+    # to the ``ide-`` namespace with a bounded charset/length so it can never
+    # collide with a Jira ``sonar_hash`` or a ``quota#...`` counter item on the
+    # shared table, nor be used to read/wedge another tenant's row (finding #3).
     idempotency_key = body.get("idempotency_key")
     if idempotency_key is not None:
-        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
-            raise IdeRequestError("field idempotency_key must be a non-empty string")
-        task_id = idempotency_key.strip()
+        task_id = _normalise_idempotency_key(idempotency_key)
     else:
         task_id = derive_task_id(actor, repo_clone_url, base_branch, description)
 
@@ -348,8 +410,12 @@ def parse_ide_request(body: dict, actor: str) -> dict:
             raise IdeRequestError("field fix_branch must be a non-empty string")
         fix_branch = fix_branch.strip()
     else:
-        # Derive a fix branch from the task_id and validate it.
-        fix_branch = f"kiro/ide-{task_id[:12]}"
+        # Derive a fix branch from the task_id and validate it. The task_id
+        # always carries the ``ide-`` prefix, so strip it before re-prefixing to
+        # avoid a redundant ``kiro/ide-ide-...`` branch name.
+        task_id_fragment = task_id[len(IDE_TASK_ID_PREFIX):] if task_id.startswith(
+            IDE_TASK_ID_PREFIX) else task_id
+        fix_branch = f"kiro/ide-{task_id_fragment[:12]}"
     validate_branch_name(fix_branch, field="fix_branch")
 
     return {

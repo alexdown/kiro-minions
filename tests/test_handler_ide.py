@@ -211,9 +211,11 @@ def test_ide_idempotency_key_override_drives_task_id(handler, jobs_table):
     resp = handler.handler_ide(event, None)
     assert resp["statusCode"] == 202
     body = json.loads(resp["body"])
-    assert body["task_id"] == "my-key-xyz"
-    # The claimed row is keyed by the client-supplied id.
-    assert jobs_table.get_item(Key={"sonar_hash": "my-key-xyz"})["Item"]
+    # The override is namespaced under ``ide-`` (finding #3) so it cannot
+    # collide with a Jira hash or a quota# counter on the shared table.
+    assert body["task_id"] == "ide-my-key-xyz"
+    # The claimed row is keyed by the namespaced client-supplied id.
+    assert jobs_table.get_item(Key={"sonar_hash": "ide-my-key-xyz"})["Item"]
 
 
 # ---------------------------------------------------------------------------

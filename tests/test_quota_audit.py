@@ -96,8 +96,8 @@ def test_quota_under_limit_allows_and_increments_counter(handler, jobs_table,
     assert "lease_expires_at" in counter_items[0]
 
 
-def test_quota_over_limit_returns_429_no_claim_no_enqueue(handler, jobs_table,
-                                                          monkeypatch):
+def test_quota_over_limit_returns_429_no_enqueue(handler, jobs_table,
+                                                 monkeypatch):
     monkeypatch.setattr(handler, "ACTOR_QUOTA_MAX", 2)
     monkeypatch.setattr(handler, "ACTOR_QUOTA_WINDOW_SECONDS", 3600)
 
@@ -110,16 +110,154 @@ def test_quota_over_limit_returns_429_no_claim_no_enqueue(handler, jobs_table,
 
     assert len(_enqueued(handler)) == 2
 
-    # The third exceeds the quota -> 429, no new claim, no new enqueue.
+    # The third exceeds the quota -> 429 and NO enqueue of genuinely new work
+    # (the key invariant). Quota now runs after the claim (finding #1), so the
+    # row is briefly created and then released (marked failed) for retry.
     event = make_ide_jwt_event(_ide_body(idempotency_key="blocked"), CLAIMS)
     resp = handler.handler_ide(event, None)
     assert resp["statusCode"] == 429
     body = json.loads(resp["body"])
     assert "quota" in body["error"].lower()
 
-    # No claim row for the blocked task_id, and still only two enqueued.
-    assert "blocked" not in jobs_table.items
+    # Still only two enqueued: the over-limit task never reached the queue.
     assert len(_enqueued(handler)) == 2
+    # The released row is retryable, not wedged in_flight.
+    assert jobs_table.items["ide-blocked"]["status"] == handler.STATUS_FAILED
+
+
+def test_idempotent_redispatch_does_not_consume_quota(handler, jobs_table,
+                                                      monkeypatch):
+    """Finding #1: re-dispatching the SAME task_id must not burn a quota slot.
+
+    With a finite quota of 1, the first dispatch of a task_id claims + counts
+    (slot used). Re-dispatching the SAME task_id returns 200 "skipped" WITHOUT
+    touching the quota counter, so a brand-new, DIFFERENT task_id still has the
+    (only remaining) slot available rather than being wrongly 429'd.
+    """
+    monkeypatch.setattr(handler, "ACTOR_QUOTA_MAX", 1)
+    monkeypatch.setattr(handler, "ACTOR_QUOTA_WINDOW_SECONDS", 3600)
+
+    # First dispatch of task "same" — claimed + counted (quota now at 1/1).
+    same = make_ide_jwt_event(_ide_body(idempotency_key="same"), CLAIMS)
+    assert handler.handler_ide(same, None)["statusCode"] == 202
+
+    # The per-actor counter reads exactly 1 after the first (new) dispatch.
+    counters = [
+        v for k, v in jobs_table.items.items()
+        if isinstance(k, str) and k.startswith("quota#dev-123#")
+    ]
+    assert counters and counters[0]["count"] == 1
+
+    # Re-dispatch the SAME task_id twice (double-click / dropped 202). Each is a
+    # skipped claim -> 200, and must NOT increment the quota counter.
+    for _ in range(2):
+        resp = handler.handler_ide(same, None)
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["status"] == "skipped"
+
+    counters = [
+        v for k, v in jobs_table.items.items()
+        if isinstance(k, str) and k.startswith("quota#dev-123#")
+    ]
+    assert counters[0]["count"] == 1, "skipped re-dispatch must not consume quota"
+
+    # Only ONE enqueue happened despite three POSTs of the same task.
+    assert len(_enqueued(handler)) == 1
+
+    # A genuinely NEW, different task still has the remaining slot: it is NOT
+    # wrongly 429'd by the earlier retries.
+    other = make_ide_jwt_event(_ide_body(idempotency_key="other"), CLAIMS)
+    resp = handler.handler_ide(other, None)
+    assert resp["statusCode"] == 429, (
+        "the single real slot was consumed by 'same'; 'other' is correctly over "
+        "the limit — but only because retries did NOT erode the quota"
+    )
+
+
+def test_quota_over_limit_releases_claim_for_retry(handler, jobs_table,
+                                                    monkeypatch):
+    """Over-the-limit new work is claimed-then-released so it stays retryable.
+
+    Because the quota now runs AFTER the claim (finding #1), an over-limit
+    dispatch briefly creates the row. We release it by marking it ``failed`` so
+    a later dispatch (in a fresh window) can re-claim it instead of finding it
+    wedged ``in_flight``.
+    """
+    monkeypatch.setattr(handler, "ACTOR_QUOTA_MAX", 1)
+
+    assert handler.handler_ide(
+        make_ide_jwt_event(_ide_body(idempotency_key="first"), CLAIMS), None
+    )["statusCode"] == 202
+
+    resp = handler.handler_ide(
+        make_ide_jwt_event(_ide_body(idempotency_key="blocked"), CLAIMS), None
+    )
+    assert resp["statusCode"] == 429
+
+    # The blocked task_id row exists but is left in a retryable terminal state.
+    row = jobs_table.items.get("ide-blocked")
+    assert row is not None
+    assert row["status"] == handler.STATUS_FAILED
+    # No enqueue for the blocked task.
+    assert len(_enqueued(handler)) == 1
+
+
+def test_quota_fail_open_emits_observable_signal(handler, capsys, monkeypatch):
+    """Finding #2: a fail-open must emit a distinct, greppable signal."""
+    monkeypatch.setattr(handler, "ACTOR_QUOTA_MAX", 1)
+
+    from botocore.exceptions import ClientError
+
+    def boom(*args, **kwargs):
+        raise ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException"}},
+            "UpdateItem",
+        )
+
+    table = handler._dynamodb.Table(handler.DYNAMODB_TABLE)
+    monkeypatch.setattr(table, "update_item", boom)
+
+    event = make_ide_jwt_event(_ide_body(idempotency_key="fo-signal"), CLAIMS)
+    resp = handler.handler_ide(event, None)
+    assert resp["statusCode"] == 202  # fail-open: dispatch still succeeds
+
+    out = capsys.readouterr().out
+    events = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get("event") == handler.QUOTA_FAIL_OPEN_EVENT:
+            events.append(obj)
+    assert events, "expected an observable quota_fail_open signal"
+    assert events[-1]["actor"] == "dev-123"
+    assert "error" in events[-1]["reason"].lower()
+
+
+def test_quota_fail_open_signal_redacts_secret(handler, capsys, monkeypatch):
+    """The fail-open signal must never leak a secret in its reason."""
+    secret = "ghp_FAILOPEN_SECRET_123456"
+    monkeypatch.setenv("GITHUB_TOKEN", secret)
+    monkeypatch.setattr(handler, "ACTOR_QUOTA_MAX", 1)
+
+    from botocore.exceptions import ClientError
+
+    def boom(*args, **kwargs):
+        raise ClientError(
+            {"Error": {"Code": f"Boom {secret}"}}, "UpdateItem"
+        )
+
+    table = handler._dynamodb.Table(handler.DYNAMODB_TABLE)
+    monkeypatch.setattr(table, "update_item", boom)
+
+    handler.handler_ide(
+        make_ide_jwt_event(_ide_body(idempotency_key="fo-sec"), CLAIMS), None
+    )
+    assert secret not in capsys.readouterr().out
 
 
 def test_quota_is_per_actor(handler, monkeypatch):
@@ -176,7 +314,7 @@ def test_ide_audit_records_claimed(handler, capsys):
     rec = records[-1]
     assert rec["source"] == "kiro-ide"
     assert rec["actor"] == "dev-123"
-    assert rec["task_id"] == "aud-1"
+    assert rec["task_id"] == "ide-aud-1"
     assert rec["repo"] == REPO
     assert rec["outcome"] == handler.AUDIT_CLAIMED
     assert isinstance(rec["ts"], int)

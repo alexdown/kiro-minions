@@ -46,8 +46,10 @@ def test_happy_path_maps_to_task_payload_fields():
     assert mapped["acceptance"] == "tests_pass"
     assert mapped["file_to_fix"] is None
     assert mapped["task_id"].startswith("ide-")
-    # Derived fix branch is validated and references the task_id fragment.
-    assert mapped["fix_branch"] == f"kiro/ide-{mapped['task_id'][:12]}"
+    # Derived fix branch is validated and references the task_id fragment with
+    # the redundant ``ide-`` prefix stripped (task_id already carries it).
+    fragment = mapped["task_id"][len("ide-"):]
+    assert mapped["fix_branch"] == f"kiro/ide-{fragment[:12]}"
 
 
 def test_optional_fields_passed_through():
@@ -86,9 +88,55 @@ def test_idempotency_key_override():
     mapped = parser.parse_ide_request(
         _request(idempotency_key="client-supplied-123"), ACTOR
     )
-    assert mapped["task_id"] == "client-supplied-123"
-    # Derived fix branch follows the overridden task_id.
+    # The override is namespaced under ``ide-`` (finding #3): a bare key is
+    # prefixed so it can never collide with a Jira hash or a quota# counter.
+    assert mapped["task_id"] == "ide-client-supplied-123"
+    # Derived fix branch follows the overridden task_id (prefix stripped once).
     assert mapped["fix_branch"] == "kiro/ide-client-suppl"
+
+
+def test_idempotency_key_with_ide_prefix_is_idempotent():
+    # A caller that echoes a previously-returned task_id (already ``ide-``
+    # prefixed) is accepted without double-prefixing.
+    mapped = parser.parse_ide_request(
+        _request(idempotency_key="ide-client-supplied-123"), ACTOR
+    )
+    assert mapped["task_id"] == "ide-client-supplied-123"
+
+
+def test_idempotency_key_rejects_quota_prefix():
+    # A client must not be able to target the per-actor quota counter namespace.
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(
+            _request(idempotency_key="quota#dev-123#999"), ACTOR
+        )
+
+
+def test_idempotency_key_rejects_hash_character():
+    # ``#`` is excluded from the charset so the key cannot enter any ``x#y``
+    # namespace (quota counters, or any future shared-table convention).
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(
+            _request(idempotency_key="ide-foo#bar"), ACTOR
+        )
+
+
+def test_idempotency_key_rejects_overlong():
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(
+            _request(idempotency_key="x" * 200), ACTOR
+        )
+
+
+def test_idempotency_key_rejects_whitespace_and_slash():
+    for bad in ("has space", "has/slash", "has\ttab"):
+        with pytest.raises(parser.IdeRequestError):
+            parser.parse_ide_request(_request(idempotency_key=bad), ACTOR)
+
+
+def test_idempotency_key_empty_rejected():
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(_request(idempotency_key="   "), ACTOR)
 
 
 @pytest.mark.parametrize("field", ["repo_clone_url", "description", "summary"])

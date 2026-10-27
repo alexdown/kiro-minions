@@ -61,9 +61,16 @@ debugging cost/abuse.
 - **B — worker cap via SQS backpressure**: the consumer concurrency cap is the
   effective AgentCore worker ceiling; SQS buffers the rest (no new resource).
 - **C — per-actor dispatch quota** enforced in `handler_ide` via a
-  DynamoDB-backed atomic counter (`ACTOR_QUOTA_MAX` /
-  `ACTOR_QUOTA_WINDOW_SECONDS`); over the limit returns HTTP 429 before any
-  claim/enqueue. `0`/unset = unlimited.
+  DynamoDB-backed atomic counter over a FIXED (tumbling) window
+  (`ACTOR_QUOTA_MAX` / `ACTOR_QUOTA_WINDOW_SECONDS`); over the limit returns
+  HTTP 429 before any *enqueue of new work*. `0`/unset = unlimited. The quota is
+  counted only on a **successful (new) idempotency claim**, AFTER the claim and
+  before the enqueue: an idempotent re-dispatch of an already-claimed/done
+  `task_id` (double-click / dropped 202) returns `200 skipped` and does NOT
+  consume a slot, so legitimate retries cannot erode a developer's quota or
+  429 them for the same task. A counter-backend error fails OPEN (dispatch
+  proceeds) but emits a distinct, greppable `quota_fail_open` signal so an
+  operator can alarm on a sustained fault that silently removes the ceiling.
 - **D — cost guardrail, ALERT-ONLY**: an AWS Budget notifies an SNS topic on
   spend. A hard fail-closed cap is **deferred** on purpose (it can block
   legitimate work); revisit once real usage is observed.

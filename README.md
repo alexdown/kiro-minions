@@ -136,7 +136,12 @@ the Lambda runs, and the Lambda only reads the verified claims (`sub`/`email` �
 - **Server-derived `task_id`.** By default the `task_id` is a stable
   `sha256(actor + repo_clone_url + base_branch + description)` (prefixed
   `ide-`), so a double-click / dropped-response re-dispatch is idempotent. A
-  client may override it with `idempotency_key`.
+  client may override it with `idempotency_key`; the override is **constrained**
+  — forced into the `ide-` namespace and matched against
+  `^[A-Za-z0-9._-]{1,128}$` (after an optional leading `ide-`). This rejects
+  `#`, whitespace, and overlong values, so a client-supplied key can never
+  collide with a Jira `sonar_hash` or a per-actor `quota#…` counter on the
+  shared table, nor target another tenant's row via the status API.
 - The logical `task_id` is carried in the **physical `sonar_hash` partition-key
   attribute** (ADR-004), so the claim/lease logic, the consumer, and the runtime
   are reused unchanged.
@@ -150,17 +155,28 @@ every few seconds until a terminal status. Returns
 `{task_id, status, phase?, pr_url? (when done), reason? (REDACTED, when
 failed/tests_failed), updated_at?}`. `phase` is a coarse progress field
 (`queued → cloning → fixing → testing → opening_pr → <terminal>`, ADR-003).
-`404` when the task id is unknown.
+`404` when the task id is unknown. IDE-sourced tasks are **owner-scoped**: a
+verified identity may only read its own IDE tasks (the row records the
+dispatching `actor`); another identity gets `404` (existence is not leaked).
+Jira-sourced rows have no per-developer owner and stay readable by any verified
+identity.
 
 ### Per-actor dispatch quota + audit log (ADR-007)
 
-- **Per-actor quota (C).** Before claiming, `POST /tasks` counts the dispatch
-  against the `actor`'s rolling window using a DynamoDB-backed atomic counter.
-  Over the limit returns **`429`** with a redacted reason and performs **no
-  claim and no enqueue**. Tuned by `ACTOR_QUOTA_MAX` (0/unset = unlimited, i.e.
-  quota disabled) and `ACTOR_QUOTA_WINDOW_SECONDS` (default `3600`). A
-  counter-backend error **fails open** so a transient DynamoDB blip cannot wedge
-  the ingress path.
+- **Per-actor quota (C).** `POST /tasks` counts a dispatch against the
+  `actor`'s **fixed (tumbling) window** using a DynamoDB-backed atomic counter.
+  The count happens only on a **successful (new) idempotency claim**, after the
+  claim and before the enqueue: an idempotent re-dispatch of an
+  already-`in_flight`/`done` `task_id` returns `200 {status: "skipped"}` and
+  does **not** consume a slot, so retries can't erode a developer's quota or
+  `429` them for the same task. Over the limit returns **`429`** with a redacted
+  reason and performs **no enqueue of new work** (the briefly-claimed row is
+  released to `failed` so it stays retryable). Tuned by `ACTOR_QUOTA_MAX`
+  (0/unset = unlimited, i.e. quota disabled) and `ACTOR_QUOTA_WINDOW_SECONDS`
+  (default `3600`). A counter-backend error **fails open** so a transient
+  DynamoDB blip cannot wedge the ingress path, and emits a distinct, greppable
+  `quota_fail_open` JSON signal so a sustained fault (which silently removes the
+  abuse ceiling) can be alarmed on.
 - **Audit log (E).** Both the Jira `handler` and the IDE `handler_ide` emit one
   structured, **redacted** audit record per dispatch decision — `actor`,
   `task_id`, `repo`, `source`, `outcome`
