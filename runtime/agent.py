@@ -1379,6 +1379,17 @@ async def entrypoint(payload: dict):
     log.info("Received payload: ticket_id=%s sonar_hash=%s",
              payload.get("ticket_id"), payload.get("sonar_hash"))
 
+    # Routing (ADR-002 Option C): a 'spec' task offloads a WHOLE tasks.md to the
+    # spec-executor worker. Branch EARLY and delegate so the one_shot path below
+    # stays behaviourally unchanged. The default/absent task_type is one_shot.
+    # spec_agent is imported lazily to avoid an import cycle (it imports agent).
+    if payload.get("task_type") == "spec":
+        import spec_agent
+
+        async for item in spec_agent.run_spec_dispatch(payload):
+            yield item
+        return
+
     sonar_hash = payload.get("sonar_hash")
 
     yield {"event": {"text": redact(
