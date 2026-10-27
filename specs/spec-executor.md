@@ -9,10 +9,15 @@ reusing `runtime/agent.py` building blocks.
 
 ---
 
-> **Proposed enhancement:** adversarial review + verify-vs-spec gates before the
-> PR are proposed (not yet built) in [verification-gates.md](verification-gates.md)
-> / [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md). Today
-> the only per-task gate is "the repo's tests pass" (§5).
+> **Verification gates (ADR-008, IMPLEMENTED):** adversarial review (Gate A) +
+> verify-vs-spec (Gate B) run as a bounded POST-LOOP phase before the PR, behind
+> the default-off `SPEC_REVIEW_ENABLED` / `SPEC_VERIFY_SPEC_ENABLED` flags; the
+> shared logic lives in `runtime/review_gates.py` and the SAME gates also run
+> post-fix on the one-shot minion (Q6 override). See
+> [verification-gates.md](verification-gates.md) /
+> [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md). With
+> the flags off, the only per-task gate is still "the repo's tests pass" (§5) and
+> both worker paths are byte-for-byte unchanged.
 
 ## 1. What this worker is for
 
@@ -188,6 +193,9 @@ and a test reload picks up overrides:
 | `SPEC_MAX_TASKS` | `50` | Cap on tasks EXECUTED in one job (already-done `[x]` tasks are skipped and do not count). `0`/unset = unlimited. |
 | `SPEC_JOB_TIMEOUT_S` | `3600` | Overall wall-clock budget across the whole loop (`time.monotonic`). |
 | `KIRO_TIMEOUT_S` | (reused) | Per-task `kiro-cli` timeout; reused from the one-shot path. |
+| `SPEC_REVIEW_ENABLED` | `off` | Enables Gate A (adversarial review) in the ADR-008 post-loop phase. Read at `review_gates` module level; gates BOTH worker paths. |
+| `SPEC_VERIFY_SPEC_ENABLED` | `off` | Enables Gate B (verify-vs-spec). On the one-shot path Gate B is skip-with-notice (no Kiro spec). |
+| `SPEC_REVIEW_TIMEOUT_S` | `300` | Per gate-pass `kiro-cli` timeout; counts toward `SPEC_JOB_TIMEOUT_S` on the spec path. A breach → INCONCLUSIVE (fail safe → draft). There is NO `SPEC_MAX_REVIEW_RETRIES` (ADR-008 Q4). |
 
 A wall-clock or executed-task breach mid-loop is handled exactly like a blocker:
 stop, keep prior commits, push, open a draft PR, and record which budget was

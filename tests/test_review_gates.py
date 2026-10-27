@@ -37,6 +37,15 @@ def restore_runner():
     original = agent.RUNNER
     yield
     agent.RUNNER = original
+    # Test isolation: ``_reload_with_flags`` reloads review_gates with the gate
+    # flags ON, which mutates the module-level ``SPEC_REVIEW_ENABLED`` /
+    # ``SPEC_VERIFY_SPEC_ENABLED``. monkeypatch restores the ENV at test end but
+    # NOT the already-reloaded module constants; a later test that reads those
+    # constants (e.g. the one-shot run_pipeline gate phase, FEAT-003) would then
+    # see them stuck ON. Reload once more here with the (now-restored) clean env
+    # so the module returns to its flags-OFF default, mirroring the teardown in
+    # tests/test_spec_gates.py.
+    importlib.reload(review_gates)
 
 
 def _reload_with_flags(monkeypatch, *, gate_a=False, gate_b=False,

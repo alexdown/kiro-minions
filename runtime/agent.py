@@ -976,11 +976,20 @@ def _build_pr_body(ticket_id: str, ticket_url: str, sonar_hash: str,
                    baseline_passed: bool | None,
                    test_output: str | None,
                    staged_files: list[str] | None,
-                   repeated_failure: bool = False) -> str:
+                   repeated_failure: bool = False,
+                   verification_section: str | None = None) -> str:
     """Compose the PR body (always routed through redact() by the caller).
 
     Draft PRs surface WHY they need review: the truncated failing output and the
     baseline (pre-fix) result, or a human-review note when no tests were found.
+
+    ``verification_section`` (ADR-008 Q6 one-shot integration) is appended as a
+    ``## Verification`` block ONLY on the success/gate path — i.e. when the
+    post-fix gate phase ran (Gate A on the one-shot diff; Gate B skip-with-notice
+    since the one-shot path has no Kiro spec). It is ``None`` whenever the gates
+    did not run (flags off, OR the ``no_tests`` / tests-still-failing draft
+    paths, which NEVER run the gates), keeping those bodies byte-for-byte
+    unchanged.
     """
     lines = [
         "## Automated SonarQube Fix",
@@ -1039,6 +1048,11 @@ def _build_pr_body(ticket_id: str, ticket_url: str, sonar_hash: str,
         lines += [f"- `{path}`" for path in staged_files]
         lines += [""]
 
+    # ADR-008 Q6: the post-fix verification gates' "Verification" section
+    # (success/gate path only; None on the no_tests / tests-failing drafts).
+    if verification_section:
+        lines += [verification_section.strip(), ""]
+
     lines += ["This PR was generated automatically by kiro-minions.", ""]
     return "\n".join(lines)
 
@@ -1050,7 +1064,8 @@ def step_open_pr(repo_dir: Path, base_branch: str, fix_branch: str,
                  baseline_passed: bool | None = None,
                  test_output: str | None = None,
                  staged_files: list[str] | None = None,
-                 repeated_failure: bool = False) -> str:
+                 repeated_failure: bool = False,
+                 verification_section: str | None = None) -> str:
     """Open a GitHub PR and return the PR URL.
 
     ``draft=True`` appends ``--draft`` to the ``gh pr create`` argv (keeping the
@@ -1068,6 +1083,7 @@ def step_open_pr(repo_dir: Path, base_branch: str, fix_branch: str,
         draft=draft, no_tests=no_tests, tests_passed=tests_passed,
         baseline_passed=baseline_passed, test_output=test_output,
         staged_files=staged_files, repeated_failure=repeated_failure,
+        verification_section=verification_section,
     ))
 
     argv = [
@@ -1344,12 +1360,86 @@ def run_pipeline(payload: dict) -> dict:
                 "staged_files": staged_files,
             }
 
+        # -----------------------------------------------------------------
+        # POST-FIX VERIFICATION GATES (ADR-008 Q6 one-shot integration).
+        #
+        # Runs ONLY on the SUCCESS path reached here: the fix loop produced
+        # tests_passed=True, step_commit found changes, and step_push ran. The
+        # no_tests draft path and the tests-still-failing draft path returned
+        # earlier and NEVER run the gates (they already open a draft PR for
+        # other reasons).
+        #
+        # The gate logic lives entirely in runtime/review_gates.run_gates (the
+        # SINGLE shared module both worker paths call); this path only wires it
+        # in. Gate A reviews the one-shot cumulative diff + the ticket
+        # description/summary as intent. Gate B is a documented skip-with-notice
+        # here (acceptance_text=None) because the one-shot path has no Kiro spec
+        # (ADR-008 Q3 absent-spec rule) — it becomes meaningful only if a future
+        # one-shot source supplies acceptance criteria.
+        #
+        # CRITICAL (flags-OFF = byte-for-byte unchanged): we only compute the
+        # cumulative diff and call run_gates when at least one gate flag is ON.
+        # With both flags OFF this whole block is skipped, so NO extra
+        # `git diff base..fix` and NO extra kiro-cli review call happens, and the
+        # PR stays non-draft with no Verification section — exactly as today.
+        # review_gates is imported function-locally to avoid an import cycle
+        # (review_gates imports agent), mirroring the lazy spec_agent import.
+        import review_gates  # noqa: PLC0415 - function-local to avoid import cycle
+
+        gate_driven_draft = False
+        gate_verification_section: str | None = None
+        if (review_gates.SPEC_REVIEW_ENABLED
+                or review_gates.SPEC_VERIFY_SPEC_ENABLED):
+            # ADR-003 progress parity with the spec-executor phase.
+            write_phase(sonar_hash, "reviewing")
+            diff_result = _run(
+                ["git", "diff", f"{base_branch}..{fix_branch}"],
+                cwd=repo_dir, check=False,
+            )
+            diff = diff_result.stdout or ""
+            if diff.strip():
+                # Gate A intent: the ticket description + summary already in
+                # scope (the one-shot path's "intent").
+                intent_parts = [p for p in (description, summary) if p]
+                intent = "\n\n".join(intent_parts)
+                # acceptance_text=None -> Gate B skip-with-notice on one-shot.
+                phase_result = review_gates.run_gates(
+                    repo_dir, diff, intent, acceptance_text=None,
+                )
+                if phase_result.any_gate_ran:
+                    gate_driven_draft = phase_result.should_draft
+                    gate_verification_section = (
+                        phase_result.verification_section
+                    )
+
         pr_url = step_open_pr(
             repo_dir, base_branch, fix_branch, summary, ticket_id,
-            ticket_url, sonar_hash, draft=False, no_tests=False,
+            ticket_url, sonar_hash, draft=gate_driven_draft, no_tests=False,
             tests_passed=True, baseline_passed=baseline_passed,
             staged_files=staged_files,
+            verification_section=gate_verification_section,
         )
+
+    # Status mapping: a gate-driven draft (ADR-008 Q4/Q5 — a high-severity or
+    # inconclusive Gate A finding) keeps the commits pushed but downgrades the
+    # otherwise-success PR to a DRAFT, so the terminal status maps to the
+    # existing RETRYABLE-ish STATUS_TESTS_FAILED (mirroring the tests-failing
+    # draft) rather than a clean success. With the flags OFF gate_driven_draft
+    # is always False, so this returns the EXACT existing non-draft success
+    # shape and the existing one-shot tests are unchanged.
+    if gate_driven_draft:
+        return {
+            "status": STATUS_TESTS_FAILED,
+            "reason": "verification gate(s) flagged the change: Gate A",
+            "pr_url": pr_url,
+            "draft": True,
+            "no_tests": False,
+            "tests_passed": tests_passed,
+            "baseline": baseline_result,
+            "test_output": truncated_output,
+            "attempts": attempt,
+            "staged_files": staged_files,
+        }
 
     return {
         "status": "success",

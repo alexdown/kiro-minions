@@ -1,8 +1,12 @@
 # Spec: verification gates for the spec-executor (adversarial review + verify-vs-spec)
 
-**Status:** ACCEPTED — implementation in progress. (Gate placement is post-loop,
-once per task group; see §3. Decisions Q1–Q7 recorded in the ADR, with Q6
-overridden to apply to BOTH worker paths.)
+**Status:** ACCEPTED — IMPLEMENTED on both worker paths behind default-off
+flags. (Gate placement is post-loop, once per task group; see §3. Decisions
+Q1–Q7 recorded in the ADR, with Q6 overridden to apply to BOTH worker paths.)
+The shared gate logic lives in `runtime/review_gates.py`
+(`run_gates(repo_dir, diff, intent, acceptance_text) -> GatePhaseResult`),
+called by `runtime/spec_agent.run_spec_pipeline` (post-loop) and
+`runtime/agent.run_pipeline` (post-fix, success path only).
 **Decision record:** [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md) (ACCEPTED)
 **Builds on:** [spec-executor.md](spec-executor.md), [adr/ADR-002-task-shape.md](adr/ADR-002-task-shape.md)
 **Inspiration:** the "AI Software Development Lifecycle" pattern — `BUILD → VERIFY → REVIEW → VERIFY-VS-SPEC → human gate`, with review failures looping back to the builder and spec failures escalating to the planner.
@@ -178,13 +182,28 @@ Gate A needs no new inputs (it works from the cumulative branch diff + the
 - **Budgets (ADR-007 family):** new, env-configurable like the existing
   `SPEC_*` vars:
   - `SPEC_REVIEW_ENABLED` / `SPEC_VERIFY_SPEC_ENABLED` — feature flags so each
-    gate can be rolled out / disabled per deployment (ADR-008 Q7).
-  - `SPEC_REVIEW_TIMEOUT_S` — per gate-pass timeout; gate passes count toward the
-    overall `SPEC_JOB_TIMEOUT_S` wall-clock budget.
-  - `SPEC_MAX_REVIEW_RETRIES` — **only exists if** ADR-008 Q4 chooses the
-    optional bounded auto-remediation path (max post-loop BUILD→re-gate cycles
-    before downgrading to a draft PR). With the recommended draft-PR-to-human
-    routing there is no review-retry loop and this var is not needed.
+    gate (Gate A / Gate B respectively) can be rolled out / disabled per
+    deployment (ADR-008 Q7). **Default off.** Read at `review_gates` module
+    level, so a redeploy (or a test `importlib.reload`) picks up the change.
+    The same two flags gate BOTH worker paths (Q6).
+  - `SPEC_REVIEW_TIMEOUT_S` — per gate-pass timeout (**default `300`**, mirroring
+    `agent.KIRO_TIMEOUT_S`); on the spec-executor path gate passes count toward
+    the overall `SPEC_JOB_TIMEOUT_S` wall-clock budget, while the one-shot path
+    has no job-timeout, so the per-gate timeout stands alone there. A pass that
+    exceeds it is treated as INCONCLUSIVE (fail safe → draft).
+  - `SPEC_MAX_REVIEW_RETRIES` — **does not exist.** ADR-008 Q4 chose
+    draft-PR-to-human routing (no auto-remediation loop), so there is no
+    review-retry cycle and this var is deliberately absent from the code.
+- **Verdict schema (implemented in `review_gates`):** each gate pass must emit a
+  single fenced ` ```json ` block `{ "verdict": <str>, "findings": [ ... ] }`.
+  `verdict` is `APPROVED` / `CHANGES_REQUESTED` for Gate A and
+  `SATISFIES_SPEC` / `DOES_NOT_SATISFY` for Gate B; each finding is
+  `{ "severity": "high" | "low", "file": <str|null>, "line": <int|null>,
+  "message": <str> }`. The parser is DEFENSIVE + FAIL SAFE: an unparseable /
+  unknown-verdict / timed-out pass becomes `INCONCLUSIVE` (→ draft), and an
+  unknown/missing `severity` is coerced to `high` (→ draft). A `high` finding
+  (or a failing/inconclusive verdict) downgrades the PR to draft; `low`-only
+  findings are advisory and the PR stays non-draft (Q5).
 - **Secret safety:** every review/verify brief, finding, verdict, and PR line is
   routed through `redact()` and delivered on STDIN, exactly like the coding
   brief. No diff or finding may leak a secret into argv/logs/PR.
@@ -240,5 +259,7 @@ Recorded in [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.m
   `SPEC_VERIFY_SPEC_ENABLED` defaulting **off** (recommended) or on; and a
   `SPEC_REVIEW_TIMEOUT_S` per-gate bound.
 
-Nothing is built yet. Once you record the decisions in ADR-008, a fresh session
-implements the post-loop review phase on top of the spec-executor.
+These decisions are RECORDED in ADR-008 and IMPLEMENTED: the shared gate phase
+runs post-loop on the spec-executor and post-fix on the one-shot minion, behind
+the default-off `SPEC_REVIEW_ENABLED` / `SPEC_VERIFY_SPEC_ENABLED` flags. The
+section above is retained as the question-by-question rationale.
