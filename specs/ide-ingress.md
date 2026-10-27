@@ -1,6 +1,8 @@
 # Spec: Kiro IDE task ingress (remote worker hand-off)
 
-**Status:** DRAFT v1 — for review. No code in this branch; specs only.
+**Status:** ACCEPTED v1 — implemented. ADR-001..007 accepted with the
+recommended options; the ingress (`POST /tasks`), status poll
+(`GET /tasks/{task_id}`), per-actor quota, and audit log are live.
 **Author:** kiro-minions agent (first pass)
 **Related:** [overview.md](overview.md), [payload.md](payload.md), [runtime.md](runtime.md), [adr/README.md](adr/README.md)
 

@@ -1,6 +1,7 @@
 # ADR-007: Concurrency, quota & cost guardrails for scaled parallelism
 
-**Status:** PROPOSED (needs your decision)
+**Status:** ACCEPTED — v1 minimum = A + B + C + D (alert-only) + E; a hard
+fail-closed spend cap is deferred until real usage is observed.
 **Context doc:** [../ide-ingress.md](../ide-ingress.md) §8
 
 ## Context
@@ -53,10 +54,21 @@ debugging cost/abuse.
 
 ## Decision
 
-_To be recorded by the maintainer._ Recommendation for **v1 minimum**:
-**A (Lambda concurrency) + B (worker cap, SQS backpressure) + C (per-actor
-quota) + D (budget alarms, alert-only to start) + E (audit log)**. Defer a hard
-enforced spend cap until you've seen real usage.
+**Accepted (v1 minimum): A + B + C + D (alert-only) + E.**
+
+- **A — Lambda reserved concurrency** on the ingress and consumer
+  (`IngressReservedConcurrency` / `ConsumerReservedConcurrency` params).
+- **B — worker cap via SQS backpressure**: the consumer concurrency cap is the
+  effective AgentCore worker ceiling; SQS buffers the rest (no new resource).
+- **C — per-actor dispatch quota** enforced in `handler_ide` via a
+  DynamoDB-backed atomic counter (`ACTOR_QUOTA_MAX` /
+  `ACTOR_QUOTA_WINDOW_SECONDS`); over the limit returns HTTP 429 before any
+  claim/enqueue. `0`/unset = unlimited.
+- **D — cost guardrail, ALERT-ONLY**: an AWS Budget notifies an SNS topic on
+  spend. A hard fail-closed cap is **deferred** on purpose (it can block
+  legitimate work); revisit once real usage is observed.
+- **E — audit log** of every dispatch decision (actor, task_id, repo, source,
+  outcome, timestamp), redacted, in both the Jira and IDE paths.
 
 **Questions that decide this:**
 1. What are the real concurrency ceilings (AWS account limits, AgentCore session

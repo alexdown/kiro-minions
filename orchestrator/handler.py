@@ -104,6 +104,28 @@ def _parse_allowlist(raw: str) -> list[str]:
 
 REPO_ALLOWLIST = _parse_allowlist(os.environ.get("REPO_ALLOWLIST", ""))
 
+# Per-actor dispatch quota (ADR-007 C). Limits how many IDE tasks a single
+# developer identity (``actor`` from the verified JWT claims) can dispatch per
+# rolling window, so one developer or a buggy extension cannot flood the
+# pipeline (scaled parallelism = scaled cost + blast radius). Enforced in
+# ``handler_ide`` BEFORE any claim/enqueue via a DynamoDB-backed atomic counter.
+#
+#   ACTOR_QUOTA_MAX            — max dispatches per actor per window.
+#                                0 / unset => UNLIMITED (quota disabled), which
+#                                keeps existing/unconfigured deployments working.
+#   ACTOR_QUOTA_WINDOW_SECONDS — the fixed-window length in seconds (default 1h).
+#
+# The counter is a dedicated item on the SAME JobsTable keyed by the physical
+# ``sonar_hash`` attribute as ``quota#<actor>#<window_start>`` with a TTL on
+# ``lease_expires_at`` (reused as the table's TTL attribute) so expired windows
+# are swept automatically. A counter-backend error is treated as fail-OPEN (the
+# dispatch proceeds) so a transient DynamoDB blip cannot wedge the whole ingress
+# path; the error is logged redacted.
+ACTOR_QUOTA_MAX = int(os.environ.get("ACTOR_QUOTA_MAX", "0"))
+ACTOR_QUOTA_WINDOW_SECONDS = int(
+    os.environ.get("ACTOR_QUOTA_WINDOW_SECONDS", "3600")
+)
+
 # Environment variables whose VALUES must never appear in a response body or log
 # line. These are usually NOT present in the orchestrator's environment, so this
 # is defence in depth (the runtime is the primary secret holder). redact() reads
@@ -431,6 +453,109 @@ def _mark_status(sonar_hash: str, status: str, extra: dict | None = None) -> Non
         pass
 
 
+# ---------------------------------------------------------------------------
+# Audit log of dispatch decisions (ADR-007 E)
+#
+# Every dispatch decision — in BOTH the Jira ``handler`` and the IDE
+# ``handler_ide`` — emits one structured, REDACTED audit record so operators can
+# answer "who dispatched what, when, and what happened" for multi-tenant
+# accountability and cost/abuse debugging. v1 is a single redacted JSON log line
+# via print() (matching the existing redact()/print() logging style); a
+# DynamoDB audit item is a deferred follow-up. Every string field is routed
+# through redact() so no secret (GITHUB_TOKEN / KIRO_API_KEY / WEBHOOK_SECRET)
+# can ever reach the audit output.
+# ---------------------------------------------------------------------------
+
+# Claim-outcome values recorded in the audit log.
+AUDIT_CLAIMED = "claimed"
+AUDIT_SKIPPED = "skipped"
+AUDIT_QUOTA_EXCEEDED = "quota_exceeded"
+AUDIT_REJECTED = "rejected"
+
+
+def _audit(outcome: str, *, source: str, actor: str = "", task_id: str = "",
+           repo: str = "", reason: str = "") -> None:
+    """Emit one redacted, structured audit record for a dispatch decision.
+
+    ``outcome`` is one of the AUDIT_* values. The record carries who (actor),
+    what (task_id, repo, source), when (timestamp), the claim outcome, and an
+    optional short reason. Best-effort: never raises, so audit logging cannot
+    break the request path. All free-text is routed through redact().
+    """
+    record = {
+        "audit": "dispatch_decision",
+        "ts": int(time.time()),
+        "source": source,
+        "actor": redact(actor) or "",
+        "task_id": redact(task_id) or "",
+        "repo": redact(repo) or "",
+        "outcome": outcome,
+    }
+    if reason:
+        record["reason"] = redact(reason)
+    try:
+        print(json.dumps(record))
+    except Exception:  # noqa: BLE001 - audit logging must never break dispatch
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Per-actor dispatch quota (ADR-007 C)
+# ---------------------------------------------------------------------------
+
+
+def _quota_window_start(now: int) -> int:
+    """Return the start timestamp of the fixed quota window containing ``now``."""
+    window = ACTOR_QUOTA_WINDOW_SECONDS if ACTOR_QUOTA_WINDOW_SECONDS > 0 else 1
+    return (now // window) * window
+
+
+def _check_actor_quota(actor: str) -> bool:
+    """Atomically count this dispatch against the actor's quota window.
+
+    Returns True when the dispatch is WITHIN the quota (or the quota is
+    disabled), False when the actor has EXCEEDED the limit for the current
+    window (caller returns 429 before any claim/enqueue).
+
+    Implementation: an atomic ``UpdateItem ADD`` on a dedicated counter item
+    keyed by ``quota#<actor>#<window_start>`` on the physical ``sonar_hash``
+    attribute of the JobsTable, with a TTL so expired windows are swept. The ADD
+    returns the post-increment value (ReturnValues=UPDATED_NEW); if it exceeds
+    ACTOR_QUOTA_MAX the actor is over the limit. A backend error is fail-OPEN
+    (returns True) so a transient DynamoDB blip cannot wedge the ingress path;
+    the error is logged redacted and carries no secret.
+    """
+    if ACTOR_QUOTA_MAX <= 0:
+        # Quota disabled / unlimited.
+        return True
+
+    now = int(time.time())
+    window_start = _quota_window_start(now)
+    counter_key = f"quota#{actor}#{window_start}"
+    # TTL a little past the end of the window so DynamoDB sweeps stale counters.
+    ttl = window_start + ACTOR_QUOTA_WINDOW_SECONDS + 60
+
+    table = _dynamodb.Table(DYNAMODB_TABLE)
+    try:
+        resp = table.update_item(
+            Key={"sonar_hash": counter_key},
+            UpdateExpression="ADD #c :one SET #t = :ttl",
+            ExpressionAttributeNames={"#c": "count", "#t": "lease_expires_at"},
+            ExpressionAttributeValues={":one": 1, ":ttl": ttl},
+            ReturnValues="UPDATED_NEW",
+        )
+    except ClientError as exc:
+        # Fail open: a counter-backend error must not wedge the request path.
+        print(redact(f"actor quota counter error (fail-open): {exc}"))
+        return True
+
+    count = (resp or {}).get("Attributes", {}).get("count")
+    if count is None:
+        # Could not read back the post-increment value -> fail open.
+        return True
+    return count <= ACTOR_QUOTA_MAX
+
+
 def _build_payload(ticket_id: str, summary: str, description: str,
                    header: dict, sonar_hash: str) -> dict:
     """Assemble the TicketPayload contract object.
@@ -625,6 +750,8 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     # wedges a sonar_hash or reaches the work queue. owner/repo is not a secret,
     # so it is safe to name in the reason (still routed through redact()).
     if not repo_allowed(header["repo_clone_url"], REPO_ALLOWLIST):
+        _audit(AUDIT_REJECTED, source="jira", task_id=sonar_hash,
+               repo=header["repo_clone_url"], reason="repo not in allowlist")
         return _response(
             403,
             {"error": redact(
@@ -636,9 +763,14 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     try:
         claimed = _claim_job(sonar_hash, ticket_id)
     except ClientError as exc:
+        _audit(AUDIT_REJECTED, source="jira", task_id=sonar_hash,
+               repo=header["repo_clone_url"], reason=f"dynamodb error: {exc}")
         return _response(500, {"error": redact(f"dynamodb error: {exc}")})
 
     if not claimed:
+        _audit(AUDIT_SKIPPED, source="jira", task_id=sonar_hash,
+               repo=header["repo_clone_url"],
+               reason="job already in_flight or done")
         return _response(
             200,
             {
@@ -658,6 +790,8 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
         # the job failed so a later webhook can retry, then report a redacted
         # 500. The reason string is redacted and carries no runtime output.
         _mark_status(sonar_hash, STATUS_FAILED, {"error": redact(str(exc))})
+        _audit(AUDIT_REJECTED, source="jira", task_id=sonar_hash,
+               repo=header["repo_clone_url"], reason=f"enqueue failed: {exc}")
         return _response(
             500, {"error": redact(f"enqueue failed: {exc}")}
         )
@@ -665,6 +799,8 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     # The webhook returns 202 the moment the payload is enqueued. It carries no
     # runtime output and no secret — the terminal job result is surfaced via the
     # DynamoDB job status the runtime writes itself, not the HTTP body.
+    _audit(AUDIT_CLAIMED, source="jira", task_id=sonar_hash,
+           repo=header["repo_clone_url"])
     return _response(
         202,
         {
@@ -757,12 +893,16 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
     claims = _extract_jwt_claims(event)
     actor = _actor_from_claims(claims)
     if not actor:
+        _audit(AUDIT_REJECTED, source="kiro-ide",
+               reason="missing verified developer identity")
         return _response(401, {"error": "missing verified developer identity"})
 
     # --- Parse the IDE request body ---
     try:
         body = _extract_body(event)
     except (ValueError, json.JSONDecodeError) as exc:
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor,
+               reason=f"invalid request body: {exc}")
         return _response(400, {"error": redact(f"invalid request body: {exc}")})
 
     # --- Validate + map the request to TaskPayload fields ---
@@ -772,6 +912,8 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
         # IdeRequestError covers missing/invalid request fields; the reused
         # validate_clone_url / validate_branch_name raise plain ValueError on a
         # bad URL / branch. Both are client errors -> redacted 400.
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor,
+               reason=f"invalid request: {exc}")
         return _response(400, {"error": redact(str(exc))})
 
     task_id = mapped["task_id"]
@@ -779,9 +921,26 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
 
     # --- Repo allowlist gate (before any claim/enqueue, like the Jira path) ---
     if not repo_allowed(repo_clone_url, REPO_ALLOWLIST):
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor, task_id=task_id,
+               repo=repo_clone_url, reason="repo not in allowlist")
         return _response(
             403,
             {"error": redact(f"repo not in allowlist: {repo_clone_url}")},
+        )
+
+    # --- Per-actor dispatch quota (ADR-007 C), BEFORE any claim/enqueue ---
+    # Count this dispatch against the actor's rolling window. Over the limit ->
+    # 429 with a redacted reason and NO claim / NO enqueue. The quota is a
+    # fairness/abuse guardrail for scaled parallelism; it is disabled when
+    # ACTOR_QUOTA_MAX is 0/unset.
+    if not _check_actor_quota(actor):
+        _audit(AUDIT_QUOTA_EXCEEDED, source="kiro-ide", actor=actor,
+               task_id=task_id, repo=repo_clone_url,
+               reason="per-actor dispatch quota exceeded")
+        return _response(
+            429,
+            {"error": redact("per-actor dispatch quota exceeded"),
+             "task_id": task_id},
         )
 
     # --- Idempotency claim (logical task_id -> physical sonar_hash attr) ---
@@ -790,9 +949,14 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
             task_id, task_id, extra={"source": "kiro-ide", "actor": actor}
         )
     except ClientError as exc:
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor, task_id=task_id,
+               repo=repo_clone_url, reason=f"dynamodb error: {exc}")
         return _response(500, {"error": redact(f"dynamodb error: {exc}")})
 
     if not claimed:
+        _audit(AUDIT_SKIPPED, source="kiro-ide", actor=actor, task_id=task_id,
+               repo=repo_clone_url,
+               reason="task already in_flight or done")
         return _response(
             200,
             {
@@ -812,8 +976,12 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
         # the task failed so a later dispatch can retry, then report a redacted
         # 500. The reason string is redacted and carries no runtime output.
         _mark_status(task_id, STATUS_FAILED, {"error": redact(str(exc))})
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor, task_id=task_id,
+               repo=repo_clone_url, reason=f"enqueue failed: {exc}")
         return _response(500, {"error": redact(f"enqueue failed: {exc}")})
 
+    _audit(AUDIT_CLAIMED, source="kiro-ide", actor=actor, task_id=task_id,
+           repo=repo_clone_url)
     return _response(
         202,
         {
