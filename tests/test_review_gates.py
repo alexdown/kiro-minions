@@ -196,6 +196,51 @@ def test_routing_inconclusive_drafts():
     assert "Gate A" in labels
 
 
+def test_routing_changes_requested_zero_findings_drafts():
+    # ADR-008 Q4: a FAIL verdict is the gate's top-level "not acceptable"
+    # decision, so it drafts even with NO findings at all.
+    res = review_gates.parse_verdict(
+        '```json\n{"verdict": "CHANGES_REQUESTED", "findings": []}\n```',
+        review_gates.GATE_A,
+    )
+    assert res.is_failing_verdict is True
+    assert res.high_findings == []
+    should_draft, labels = review_gates.decide_routing([res])
+    assert should_draft is True
+    assert "Gate A" in labels
+
+
+def test_routing_changes_requested_low_only_findings_drafts():
+    # A CHANGES_REQUESTED verdict whose findings are all LOW severity still
+    # drafts: the failing verdict itself routes to draft regardless of the
+    # per-finding severity (ADR-008 Q4). Low severity stays advisory only when
+    # the VERDICT passes (see test_routing_low_only_is_advisory_not_draft).
+    res = review_gates.parse_verdict(
+        '```json\n{"verdict": "CHANGES_REQUESTED", "findings": '
+        '[{"severity": "low", "message": "style nit"}]}\n```',
+        review_gates.GATE_A,
+    )
+    assert res.is_failing_verdict is True
+    assert res.high_findings == []
+    should_draft, labels = review_gates.decide_routing([res])
+    assert should_draft is True
+    assert "Gate A" in labels
+
+
+def test_routing_does_not_satisfy_low_only_findings_drafts():
+    # Same for Gate B: DOES_NOT_SATISFY with only low findings drafts.
+    res = review_gates.parse_verdict(
+        '```json\n{"verdict": "DOES_NOT_SATISFY", "findings": '
+        '[{"severity": "low", "message": "minor gap"}]}\n```',
+        review_gates.GATE_B,
+    )
+    assert res.is_failing_verdict is True
+    assert res.high_findings == []
+    should_draft, labels = review_gates.decide_routing([res])
+    assert should_draft is True
+    assert "Gate B" in labels
+
+
 def test_routing_skipped_never_drafts():
     res = review_gates.GateResult(
         kind=review_gates.GATE_B, skipped=True, skip_reason="flag disabled")
@@ -381,6 +426,27 @@ def test_run_gates_gate_a_high_names_gate_in_section(monkeypatch):
     assert "Gate A" in phase.failed_gate_labels
     assert "Gate A" in phase.verification_section
     assert "[HIGH]" in phase.verification_section
+
+
+def test_run_gates_gate_a_changes_requested_low_only_drafts(monkeypatch):
+    # End-to-end pin for the ADR-008 Q4 edge: a CHANGES_REQUESTED verdict with
+    # only LOW findings still downgrades the PR to draft and names Gate A in the
+    # rendered section (the verdict itself is the draft driver).
+    rg = _reload_with_flags(monkeypatch, gate_a=True, gate_b=False)
+    runner = FakeRunner(results=[
+        ScriptedResult(
+            stdout='```json\n{"verdict": "CHANGES_REQUESTED", "findings": '
+                   '[{"severity": "low", "file": "a.py", "line": 2, '
+                   '"message": "rename this variable"}]}\n```',
+            match="kiro-cli chat"),
+    ])
+    agent.RUNNER = runner
+
+    phase = rg.run_gates("/repo", "diff", "intent", None)
+    assert phase.should_draft is True
+    assert "Gate A" in phase.failed_gate_labels
+    assert "FLAGGED" in phase.verification_section
+    assert "CHANGES_REQUESTED" in phase.verification_section
 
 
 # ---------------------------------------------------------------------------

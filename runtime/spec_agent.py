@@ -78,6 +78,15 @@ SPEC_MAX_TASKS = int(os.environ.get("SPEC_MAX_TASKS", "50"))
 # loop stops the job like a blocker.
 SPEC_JOB_TIMEOUT_S = int(os.environ.get("SPEC_JOB_TIMEOUT_S", "3600"))
 
+# Upper bound (bytes) on a single Gate B acceptance document read from the clone
+# (requirements.md / design.md, explicit path or sibling default). A file larger
+# than this is read only up to the bound (the acceptance text is in any case
+# bounded again by agent.truncate_test_output when the Gate B brief is built);
+# the cap just stops an accidental huge/binary file from being slurped whole.
+SPEC_ACCEPTANCE_MAX_BYTES = int(
+    os.environ.get("SPEC_ACCEPTANCE_MAX_BYTES", str(256 * 1024))
+)
+
 
 # ---------------------------------------------------------------------------
 # Defence-in-depth path validation.
@@ -164,6 +173,33 @@ def _resolve_contained_file(repo_dir: Path, rel: str, field: str) -> Path:
     return target
 
 
+def _read_acceptance_doc(target: Path) -> str | None:
+    """Safely read a Gate B acceptance document, or return None to skip it.
+
+    Guards the read the same way ``_read_tasks_md`` guards its target:
+
+    * ``target.is_file()`` must hold (a missing / non-regular path — e.g. a
+      directory or a dangling optional file — is skipped, never read);
+    * the file must be Markdown (``.md``) — the acceptance source is a
+      requirements/design doc, so a non-``.md`` contained file is skipped
+      rather than read as acceptance text;
+    * the read is bounded to ``SPEC_ACCEPTANCE_MAX_BYTES`` so an accidental
+      huge/binary file can never be slurped whole into the brief.
+
+    Containment + traversal safety is already enforced by
+    ``_resolve_contained_file`` before this runs; this adds the is-file /
+    extension / size guards at the read site. Returns the decoded text, or
+    ``None`` when the file should be skipped.
+    """
+    if not target.is_file():
+        return None
+    if target.suffix.lower() != ".md":
+        return None
+    with target.open("rb") as handle:
+        raw = handle.read(SPEC_ACCEPTANCE_MAX_BYTES)
+    return raw.decode("utf-8", errors="replace")
+
+
 def _read_spec_acceptance(payload: dict, repo_dir: Path,
                           tasks_md_path: str | None) -> str | None:
     """Resolve the Gate B acceptance text (requirements.md / design.md content).
@@ -203,20 +239,18 @@ def _read_spec_acceptance(payload: dict, repo_dir: Path,
             target = _resolve_contained_file(
                 repo_dir, rel, field="requirements_md_path",
             )
-            if target.is_file():
-                have_requirements = _add(
-                    "requirements.md", target.read_text(errors="replace"),
-                )
+            have_requirements = _add(
+                "requirements.md", _read_acceptance_doc(target),
+            )
     if not have_design:
         rel = payload.get("design_md_path")
         if rel is not None:
             target = _resolve_contained_file(
                 repo_dir, rel, field="design_md_path",
             )
-            if target.is_file():
-                have_design = _add(
-                    "design.md", target.read_text(errors="replace"),
-                )
+            have_design = _add(
+                "design.md", _read_acceptance_doc(target),
+            )
 
     # (3) .kiro/specs/<feature>/ sibling default for any doc still missing: only
     # when the tasks path is itself under .kiro/specs/<feature>/tasks.md.
@@ -235,16 +269,14 @@ def _read_spec_acceptance(payload: dict, repo_dir: Path,
                     and parent.parent.parent.name == ".kiro"):
                 if not have_requirements:
                     sib = parent / "requirements.md"
-                    if sib.is_file():
-                        have_requirements = _add(
-                            "requirements.md", sib.read_text(errors="replace"),
-                        )
+                    have_requirements = _add(
+                        "requirements.md", _read_acceptance_doc(sib),
+                    )
                 if not have_design:
                     sib = parent / "design.md"
-                    if sib.is_file():
-                        have_design = _add(
-                            "design.md", sib.read_text(errors="replace"),
-                        )
+                    have_design = _add(
+                        "design.md", _read_acceptance_doc(sib),
+                    )
 
     if not sections:
         return None

@@ -1135,6 +1135,14 @@ def run_pipeline(payload: dict) -> dict:
     # not allowed; a no-op when unconfigured.
     _validate_repo_allowed(repo_clone_url)
 
+    # ADR-008 Q6: bind the gate-draft state BEFORE the `with` so the terminal
+    # `if gate_driven_draft:` (which lives outside the block, on the success
+    # fall-through) can never NameError if a future non-returning branch is
+    # introduced. The success path re-binds these inside the gate block; with
+    # the flags OFF they stay at these defaults (non-draft, no failed gates).
+    gate_driven_draft = False
+    gate_failed_labels: list[str] = []
+
     with tempfile.TemporaryDirectory(prefix="kiro-minions-") as workdir:
         workdir = Path(workdir)
 
@@ -1386,7 +1394,6 @@ def run_pipeline(payload: dict) -> dict:
         # (review_gates imports agent), mirroring the lazy spec_agent import.
         import review_gates  # noqa: PLC0415 - function-local to avoid import cycle
 
-        gate_driven_draft = False
         gate_verification_section: str | None = None
         if (review_gates.SPEC_REVIEW_ENABLED
                 or review_gates.SPEC_VERIFY_SPEC_ENABLED):
@@ -1408,6 +1415,9 @@ def run_pipeline(payload: dict) -> dict:
                 )
                 if phase_result.any_gate_ran:
                     gate_driven_draft = phase_result.should_draft
+                    gate_failed_labels = list(
+                        phase_result.failed_gate_labels
+                    )
                     gate_verification_section = (
                         phase_result.verification_section
                     )
@@ -1430,7 +1440,10 @@ def run_pipeline(payload: dict) -> dict:
     if gate_driven_draft:
         return {
             "status": STATUS_TESTS_FAILED,
-            "reason": "verification gate(s) flagged the change: Gate A",
+            "reason": redact(
+                "verification gate(s) flagged the change: "
+                + ", ".join(gate_failed_labels)
+            ),
             "pr_url": pr_url,
             "draft": True,
             "no_tests": False,

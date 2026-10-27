@@ -35,10 +35,12 @@ REUSE RULES (do not reinvent — mirror ``spec_agent.py``):
 FAIL-SAFE CONTRACT (ADR-008 Q4/Q5): the gates NEVER silently pass. An
 unparseable / garbage / timed-out gate output is treated as INCONCLUSIVE, which
 downgrades the PR to DRAFT with a notice stating the gate did not produce a
-usable verdict. A clean ``APPROVED``/``SATISFIES_SPEC`` verdict with only
-low-severity (or no) findings keeps the PR non-draft; a high-severity finding or
-a failing verdict with a high finding downgrades to DRAFT. There is deliberately
-NO ``SPEC_MAX_REVIEW_RETRIES`` and NO auto-remediation loop (Q4).
+usable verdict. A PASSING ``APPROVED``/``SATISFIES_SPEC`` verdict with only
+low-severity (or no) findings keeps the PR non-draft (low findings are
+advisory); a FAILING verdict (``CHANGES_REQUESTED``/``DOES_NOT_SATISFY``)
+downgrades to DRAFT on its own (the gate's top-level decision, ADR-008 Q4), as
+does any high-severity finding even under a passing verdict (Q5). There is
+deliberately NO ``SPEC_MAX_REVIEW_RETRIES`` and NO auto-remediation loop (Q4).
 """
 
 from __future__ import annotations
@@ -296,19 +298,29 @@ def _gate_drafts(result: GateResult) -> bool:
 
     A gate contributes to DRAFT when:
       * it is inconclusive (fail safe); OR
-      * it has >= 1 high-severity finding; OR
       * its verdict is the FAIL verdict (CHANGES_REQUESTED / DOES_NOT_SATISFY)
-        with >= 1 high finding.
-    A skipped gate never drafts. A clean pass verdict with only low (or no)
-    findings never drafts.
+        — the gate's top-level decision is "not acceptable", so it drafts
+        regardless of the severity of any individual finding; OR
+      * it has >= 1 high-severity finding (even under a PASS verdict — a
+        high-severity finding is a block by itself per ADR-008 Q5).
+
+    A skipped gate never drafts. A PASS verdict with only low-severity (or no)
+    findings never drafts — those are advisory (ADR-008 Q5).
+
+    ADR-008 reconciliation: Q4 routes a failing GATE VERDICT
+    (CHANGES_REQUESTED / DOES_NOT_SATISFY) to a draft PR; Q5's severity gate
+    layers on top of that, applying to the per-finding severity so that a
+    high-severity finding also drafts even when the overall verdict passes,
+    while low-severity findings stay advisory. A failing verdict is the gate's
+    own decision that the change is not ready, so it drafts on its own.
     """
     if result.skipped:
         return False
     if result.inconclusive:
         return True
-    if result.high_findings:
+    if result.is_failing_verdict:
         return True
-    if result.is_failing_verdict and result.high_findings:
+    if result.high_findings:
         return True
     return False
 

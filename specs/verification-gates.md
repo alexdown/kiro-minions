@@ -201,9 +201,13 @@ Gate A needs no new inputs (it works from the cumulative branch diff + the
   `{ "severity": "high" | "low", "file": <str|null>, "line": <int|null>,
   "message": <str> }`. The parser is DEFENSIVE + FAIL SAFE: an unparseable /
   unknown-verdict / timed-out pass becomes `INCONCLUSIVE` (→ draft), and an
-  unknown/missing `severity` is coerced to `high` (→ draft). A `high` finding
-  (or a failing/inconclusive verdict) downgrades the PR to draft; `low`-only
-  findings are advisory and the PR stays non-draft (Q5).
+  unknown/missing `severity` is coerced to `high` (→ draft). Draft routing
+  (ADR-008 Q4 + Q5): a **failing verdict** (`CHANGES_REQUESTED` /
+  `DOES_NOT_SATISFY`) downgrades the PR to draft on its own — a failing verdict
+  is the gate's top-level "not acceptable" decision regardless of any individual
+  finding's severity — as does an `INCONCLUSIVE` verdict or any single `high`
+  finding (even under a passing verdict). `low`-severity findings under a
+  **passing** verdict are advisory only and the PR stays non-draft (Q5).
 - **Secret safety:** every review/verify brief, finding, verdict, and PR line is
   routed through `redact()` and delivered on STDIN, exactly like the coding
   brief. No diff or finding may leak a secret into argv/logs/PR.
