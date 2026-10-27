@@ -151,6 +151,23 @@ A blocker with ZERO completed tasks does NOT open an empty PR: it returns the
 `tests_failed` result with no `pr_url`, mirroring the one-shot "no changes"
 handling.
 
+### 5.1 Preconditions and caveats
+
+Because acceptance is strictly per-task (a task is complete only when the
+repository's tests pass, and only when it produced a committable diff), two
+preconditions must hold for the target repo or the very first task will stop the
+whole spec:
+
+- **The target repo MUST have an auto-detectable test suite** (npm, mvn, pytest,
+  or make). `step_run_tests` treats "no test runner detected" as a non-pass, so
+  a repo with no detectable suite blocks on task 1. There is no per-task opt-out:
+  if a spec targets a repo without tests, add a runner (or a minimal
+  tests-pass target) before offloading.
+- **Every executed task is expected to produce a committable code diff.** A
+  no-op task, or a docs-only task that changes nothing the scoped-staging logic
+  will stage, is treated as a blocker (kiro did nothing) and stops the spec, even
+  if the tests pass. Author `tasks.md` so each task lands real, committable code.
+
 ---
 
 ## 6. Budgets and guardrails (ADR-007)

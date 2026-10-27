@@ -299,8 +299,7 @@ def _open_spec_pr(repo_dir: Path, base_branch: str, fix_branch: str,
 
 
 def _execute_task(repo_dir: Path, task: tasks_md.SpecTask, summary: str,
-                  spec_header: str, index: int, total: int,
-                  post_install: set[str]) -> tuple[bool, str]:
+                  spec_header: str, index: int, total: int) -> tuple[bool, str]:
     """Run the FRESH per-task kiro + test + retry cycle for ONE task.
 
     Returns ``(passed, last_output)``. Applies the per-task retry budget
@@ -462,7 +461,6 @@ def run_spec_pipeline(payload: dict) -> dict:
             executed += 1
             passed, output = _execute_task(
                 repo_dir, task, summary, spec_header, index, total,
-                staging_baseline,
             )
 
             if not passed:
