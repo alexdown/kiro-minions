@@ -412,6 +412,33 @@ def _require_str(body: dict, field: str) -> str:
     return value
 
 
+def _optional_repo_relative_path(body: dict, field: str) -> str | None:
+    """Validate an OPTIONAL repo-relative path field (ADR-008 Gate B input).
+
+    Returns ``None`` when the field is absent. When present it is validated with
+    ``validate_repo_relative_path`` EXACTLY like ``tasks_md_path`` (traversal
+    rejected), so a bad path raises ``IdeRequestError``.
+    """
+    raw = body.get(field)
+    if raw is None:
+        return None
+    return validate_repo_relative_path(raw, field=field)
+
+
+def _optional_inline_md(body: dict, field: str) -> str | None:
+    """Validate an OPTIONAL inline markdown field (ADR-008 Gate B input).
+
+    Returns ``None`` when absent; otherwise requires a non-empty string and
+    returns it unchanged.
+    """
+    raw = body.get(field)
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise IdeRequestError(f"field {field} must be a non-empty string")
+    return raw
+
+
 def parse_ide_request(body: dict, actor: str) -> dict:
     """Validate and map an IDE task request into TaskPayload fields.
 
@@ -449,12 +476,23 @@ def parse_ide_request(body: dict, actor: str) -> dict:
         the task_id as ``kiro/ide-<task_id-fragment>`` and validated.
       * ``idempotency_key`` — optional client override for the task_id (ADR-004).
 
+    Optional Gate B spec inputs (ADR-008 verify-vs-spec; either task type, but
+    primarily ``spec``):
+      * ``requirements_md_path`` / ``design_md_path`` — repo-relative paths to
+        the spec acceptance docs, validated with ``validate_repo_relative_path``
+        EXACTLY like ``tasks_md_path`` (traversal-safe); and/or
+      * ``requirements_md`` / ``design_md`` — inline (non-empty string) content.
+      These are OPTIONAL and default to ``None``; when absent Gate B skips with a
+      notice (never blocks), so a request without them parses unchanged.
+
     Returns a dict with keys: ``task_id``, ``source``, ``actor``,
     ``repo_clone_url``, ``base_branch``, ``fix_branch``, ``file_to_fix``,
-    ``description``, ``summary``, ``acceptance``, ``task_type``, and (for a spec
-    job, else ``None``) ``tasks_md_path`` / ``tasks_md``. Raises
-    ``IdeRequestError`` on any missing/invalid field (the handler routes the
-    reason through redact() and returns 400).
+    ``description``, ``summary``, ``acceptance``, ``task_type``, (for a spec
+    job, else ``None``) ``tasks_md_path`` / ``tasks_md``, and the optional Gate B
+    inputs ``requirements_md_path`` / ``design_md_path`` / ``requirements_md`` /
+    ``design_md`` (``None`` when absent). Raises ``IdeRequestError`` on any
+    missing/invalid field (the handler routes the reason through redact() and
+    returns 400).
     """
     if body is None or not isinstance(body, dict):
         raise IdeRequestError("request body must be a JSON object")
@@ -512,6 +550,16 @@ def parse_ide_request(body: dict, actor: str) -> dict:
         # one_shot: EXACT pre-existing required-field semantics.
         description = _require_str(body, "description")
 
+    # Optional Gate B (verify-vs-spec) acceptance inputs (ADR-008). Paths are
+    # traversal-validated exactly like tasks_md_path; inline content must be a
+    # non-empty string. All default to None so a request without them is
+    # unchanged. Available to both task types (primarily spec).
+    requirements_md_path = _optional_repo_relative_path(
+        body, "requirements_md_path")
+    design_md_path = _optional_repo_relative_path(body, "design_md_path")
+    requirements_md = _optional_inline_md(body, "requirements_md")
+    design_md = _optional_inline_md(body, "design_md")
+
     base_branch = body.get("base_branch") or "main"
     if not isinstance(base_branch, str):
         raise IdeRequestError("field base_branch must be a string")
@@ -563,4 +611,10 @@ def parse_ide_request(body: dict, actor: str) -> dict:
         # payload is unchanged.
         "tasks_md_path": tasks_md_path,
         "tasks_md": tasks_md,
+        # Optional Gate B (verify-vs-spec) acceptance inputs (ADR-008); None
+        # when absent so a request without them is byte-for-byte unchanged.
+        "requirements_md_path": requirements_md_path,
+        "design_md_path": design_md_path,
+        "requirements_md": requirements_md,
+        "design_md": design_md,
     }

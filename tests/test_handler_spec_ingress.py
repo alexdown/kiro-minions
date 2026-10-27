@@ -111,3 +111,70 @@ def test_spec_without_tasks_source_returns_400(handler):
     resp = handler.handler_ide(event, None)
     assert resp["statusCode"] == 400
     assert _enqueued(handler) == []
+
+
+# ---------------------------------------------------------------------------
+# Gate B (verify-vs-spec) acceptance inputs (ADR-008): threaded only when
+# present so a payload without them stays byte-for-byte compatible.
+# ---------------------------------------------------------------------------
+
+
+def test_spec_threads_gate_b_inputs_when_present(handler):
+    body = _spec_body(
+        requirements_md_path=".kiro/specs/my-feature/requirements.md",
+        design_md_path=".kiro/specs/my-feature/design.md",
+    )
+    event = make_ide_jwt_event(body, CLAIMS)
+    resp = handler.handler_ide(event, None)
+    assert resp["statusCode"] == 202
+
+    sent = _enqueued(handler)[0]
+    assert sent["requirements_md_path"] == ".kiro/specs/my-feature/requirements.md"
+    assert sent["design_md_path"] == ".kiro/specs/my-feature/design.md"
+    # Inline bodies not supplied -> omitted entirely.
+    assert "requirements_md" not in sent
+    assert "design_md" not in sent
+
+
+def test_spec_threads_inline_gate_b_inputs(handler):
+    body = _spec_body(
+        requirements_md="# Requirements\n1.1 SHALL ...",
+        design_md="# Design\narchitecture",
+    )
+    event = make_ide_jwt_event(body, CLAIMS)
+    resp = handler.handler_ide(event, None)
+    assert resp["statusCode"] == 202
+
+    sent = _enqueued(handler)[0]
+    assert sent["requirements_md"].startswith("# Requirements")
+    assert sent["design_md"].startswith("# Design")
+
+
+def test_spec_omits_gate_b_inputs_when_absent(handler):
+    event = make_ide_jwt_event(_spec_body(), CLAIMS)
+    resp = handler.handler_ide(event, None)
+    assert resp["statusCode"] == 202
+
+    sent = _enqueued(handler)[0]
+    for f in ("requirements_md_path", "design_md_path",
+              "requirements_md", "design_md"):
+        assert f not in sent
+
+
+def test_one_shot_omits_gate_b_inputs_when_absent(handler):
+    event = make_ide_jwt_event(_one_shot_body(), CLAIMS)
+    resp = handler.handler_ide(event, None)
+    assert resp["statusCode"] == 202
+
+    sent = _enqueued(handler)[0]
+    for f in ("requirements_md_path", "design_md_path",
+              "requirements_md", "design_md"):
+        assert f not in sent
+
+
+def test_spec_bad_requirements_md_path_returns_400(handler):
+    event = make_ide_jwt_event(
+        _spec_body(requirements_md_path="../../etc/passwd"), CLAIMS)
+    resp = handler.handler_ide(event, None)
+    assert resp["statusCode"] == 400
+    assert _enqueued(handler) == []

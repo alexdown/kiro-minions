@@ -310,3 +310,84 @@ def test_validate_repo_relative_path_accepts_normal_path():
 def test_validate_repo_relative_path_rejects(bad):
     with pytest.raises(parser.IdeRequestError):
         parser.validate_repo_relative_path(bad)
+
+
+# ---------------------------------------------------------------------------
+# Gate B (verify-vs-spec) acceptance inputs (ADR-008): requirements/design
+# ---------------------------------------------------------------------------
+
+
+def test_gate_b_inputs_default_none_when_absent():
+    # A plain one_shot request carries all four Gate B fields as None.
+    mapped = parser.parse_ide_request(_request(), ACTOR)
+    assert mapped["requirements_md_path"] is None
+    assert mapped["design_md_path"] is None
+    assert mapped["requirements_md"] is None
+    assert mapped["design_md"] is None
+
+
+def test_gate_b_inputs_default_none_for_spec_without_them():
+    mapped = parser.parse_ide_request(
+        _spec_request(tasks_md_path=".kiro/specs/x/tasks.md"), ACTOR
+    )
+    assert mapped["requirements_md_path"] is None
+    assert mapped["design_md_path"] is None
+    assert mapped["requirements_md"] is None
+    assert mapped["design_md"] is None
+
+
+def test_gate_b_accepts_requirements_and_design_paths():
+    mapped = parser.parse_ide_request(
+        _spec_request(
+            tasks_md_path=".kiro/specs/x/tasks.md",
+            requirements_md_path=".kiro/specs/x/requirements.md",
+            design_md_path=".kiro/specs/x/design.md",
+        ),
+        ACTOR,
+    )
+    assert mapped["requirements_md_path"] == ".kiro/specs/x/requirements.md"
+    assert mapped["design_md_path"] == ".kiro/specs/x/design.md"
+
+
+def test_gate_b_accepts_inline_requirements_and_design():
+    mapped = parser.parse_ide_request(
+        _spec_request(
+            tasks_md_path=".kiro/specs/x/tasks.md",
+            requirements_md="# Requirements\n1.1 The system SHALL ...",
+            design_md="# Design\nArchitecture ...",
+        ),
+        ACTOR,
+    )
+    assert mapped["requirements_md"].startswith("# Requirements")
+    assert mapped["design_md"].startswith("# Design")
+
+
+def test_gate_b_inputs_available_on_one_shot_too():
+    mapped = parser.parse_ide_request(
+        _request(requirements_md="# Requirements\nacceptance"), ACTOR
+    )
+    assert mapped["task_type"] == "one_shot"
+    assert mapped["requirements_md"].startswith("# Requirements")
+
+
+@pytest.mark.parametrize("field", ["requirements_md_path", "design_md_path"])
+@pytest.mark.parametrize(
+    "bad_path", ["../etc/passwd", "/etc/passwd", "a/../b", "-rf", "a b"]
+)
+def test_gate_b_rejects_traversal_path(field, bad_path):
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(
+            _spec_request(tasks_md_path=".kiro/specs/x/tasks.md",
+                          **{field: bad_path}),
+            ACTOR,
+        )
+
+
+@pytest.mark.parametrize("field", ["requirements_md", "design_md"])
+def test_gate_b_rejects_empty_inline(field):
+    with pytest.raises(parser.IdeRequestError):
+        parser.parse_ide_request(
+            _spec_request(tasks_md_path=".kiro/specs/x/tasks.md",
+                          **{field: "   "}),
+            ACTOR,
+        )
