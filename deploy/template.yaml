@@ -51,6 +51,83 @@ Parameters:
       orchestrator; the AgentCore Runtime re-checks the same value set
       out-of-band on its own env (defence in depth).
 
+  # --- Kiro IDE ingress: OIDC/JWT authorizer (ADR-001) ---------------------
+  # The IDE ingress (POST /tasks) and the status poll (GET /tasks/{task_id})
+  # sit behind an HTTP API JWT authorizer so API Gateway VERIFIES the developer
+  # token before the Lambda runs; the Lambda only READS the verified claims
+  # (sub/email -> actor). These two parameters configure the OIDC issuer and the
+  # expected audience for that authorizer. They do not affect the Jira webhook,
+  # which keeps its existing shared-secret/HMAC verification.
+  OidcIssuerUrl:
+    Type: String
+    Default: https://your-idp.example.com/
+    Description: >
+      OIDC issuer URL (the authorizer's ``issuer``) whose tokens authenticate
+      Kiro IDE developers on POST /tasks and GET /tasks/{task_id}. The issuer
+      must expose the standard OIDC discovery / JWKS endpoints.
+  OidcAudience:
+    Type: CommaDelimitedList
+    Default: kiro-minions-ide
+    Description: >
+      Allowed JWT audience value(s) for the IDE authorizer. A token is accepted
+      only when its ``aud`` claim matches one of these.
+
+  # --- ADR-007 A: Lambda reserved concurrency guardrails -------------------
+  # Cap how far the ingress and consumer can fan out so a burst of IDE
+  # dispatches cannot scale cost / blast radius without bound. Tune to the
+  # account's Lambda concurrency and the acceptable AgentCore/Bedrock spend.
+  IngressReservedConcurrency:
+    Type: Number
+    Default: 10
+    Description: >
+      Reserved (max) concurrent executions for the IDE IngressFunction. Bounds
+      how many simultaneous POST /tasks dispatches run; excess requests are
+      throttled by Lambda (the IDE can retry).
+  ConsumerReservedConcurrency:
+    Type: Number
+    Default: 5
+    Description: >
+      Reserved (max) concurrent executions for the ConsumerFunction. This is the
+      effective AgentCore worker cap (ADR-007 B): SQS buffers the rest, so only
+      this many Runtime invokes run at once regardless of queue depth.
+
+  # --- ADR-007 C: per-actor dispatch quota ---------------------------------
+  ActorQuotaMax:
+    Type: Number
+    Default: 0
+    Description: >
+      Max IDE dispatches per developer identity (actor) per window. 0 means
+      UNLIMITED (quota disabled). Enforced in handler_ide via a DynamoDB-backed
+      atomic counter BEFORE any claim/enqueue; over the limit returns HTTP 429.
+  ActorQuotaWindowSeconds:
+    Type: Number
+    Default: 3600
+    Description: >
+      Length of the fixed per-actor quota window in seconds (default 1 hour).
+
+  # --- ADR-007 D: cost guardrail (ALERT-ONLY budget) -----------------------
+  # An AWS Budgets alert on monthly spend that NOTIFIES an SNS topic when a
+  # threshold is crossed. This is deliberately NOT a hard fail-closed cap: a
+  # hard dispatch cap can block legitimate work, so enforcing one is DEFERRED
+  # until real usage is observed (ADR-007 D).
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 500
+    Description: >
+      Monthly cost budget limit (USD) for the alert-only AWS Budget. Crossing
+      the alert threshold notifies the SNS topic below; it never blocks work.
+  BudgetAlertSnsTopicArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of an SNS topic to notify when the budget alert threshold is crossed.
+      When empty, the Budget resource is not created (see the HasBudgetTopic
+      condition). Alert-only: no hard spend cap is enforced.
+
+Conditions:
+  # Only create the alert-only Budget when an SNS topic ARN is supplied.
+  HasBudgetTopic: !Not [!Equals [!Ref BudgetAlertSnsTopicArn, '']]
+
 Globals:
   Function:
     Runtime: python3.12
@@ -163,6 +240,10 @@ Resources:
       CodeUri: ../orchestrator/
       Handler: handler.sqs_consumer
       Timeout: 900
+      # ADR-007 A/B: cap concurrent consumers. This is the effective AgentCore
+      # worker ceiling — SQS buffers everything above it (the queue is the
+      # backpressure mechanism), so no new resource is needed for the worker cap.
+      ReservedConcurrentExecutions: !Ref ConsumerReservedConcurrency
       Environment:
         Variables:
           AGENTCORE_RUNTIME_ARN: !Ref AgentCoreRuntimeArn
@@ -187,6 +268,80 @@ Resources:
             # unrelated tickets (each message retries/DLQs independently).
             BatchSize: 1
 
+  # ---------------------------------------------------------------------------
+  # Kiro IDE ingress (ADR-002/003/005): POST /tasks
+  # -----------------------------------------------------------------------------
+  # Producer for per-developer IDE tasks. Same shape as OrchestratorFunction
+  # (validate -> per-actor quota -> claim -> enqueue -> 202) but authenticated
+  # by the JWT authorizer (ADR-001) instead of the webhook shared secret. It
+  # reuses the SAME JobsTable (logical task_id carried in the physical
+  # sonar_hash attribute, ADR-004) and the SAME JobsQueue, so the consumer and
+  # runtime are unchanged. Result delivery stays a PR via the existing runtime
+  # push+PR mechanism (ADR-006) — no new delivery code or resource.
+  IngressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: kiro-minions-ingress
+      CodeUri: ../orchestrator/
+      Handler: handler.handler_ide
+      # ADR-007 A: bound how many simultaneous IDE dispatches run.
+      ReservedConcurrentExecutions: !Ref IngressReservedConcurrency
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref JobsTable
+          SQS_QUEUE_URL: !Ref JobsQueue
+          LEASE_SECONDS: !Ref LeaseSeconds
+          REPO_ALLOWLIST: !Ref RepoAllowlist
+          # ADR-007 C: per-actor dispatch quota (0 => unlimited/disabled).
+          ACTOR_QUOTA_MAX: !Ref ActorQuotaMax
+          ACTOR_QUOTA_WINDOW_SECONDS: !Ref ActorQuotaWindowSeconds
+      Policies:
+        # Claim/mark-status + the per-actor quota counter live on the JobsTable.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        # Ingress only enqueues onto the work queue (the consumer invokes).
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt JobsQueue.QueueName
+      Events:
+        CreateTask:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Path: /tasks
+            Method: POST
+            # ADR-001: require a verified OIDC/JWT token on this route.
+            Auth:
+              Authorizer: OidcJwtAuthorizer
+
+  # ---------------------------------------------------------------------------
+  # Status polling API (ADR-003): GET /tasks/{task_id}
+  # -----------------------------------------------------------------------------
+  # READ-ONLY. The IDE polls this until a terminal status. Behind the SAME JWT
+  # authorizer as the ingress. It performs NO claim/enqueue/mutation, so it only
+  # needs read access to the JobsTable (read-only IAM policy).
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: kiro-minions-status
+      CodeUri: ../orchestrator/
+      Handler: handler.status_handler
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref JobsTable
+      Policies:
+        # Read-only: the status endpoint never mutates a row.
+        - DynamoDBReadPolicy:
+            TableName: !Ref JobsTable
+      Events:
+        GetTask:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Path: /tasks/{task_id}
+            Method: GET
+            Auth:
+              Authorizer: OidcJwtAuthorizer
+
   WebhookApi:
     Type: AWS::Serverless::HttpApi
     Properties:
@@ -200,6 +355,55 @@ Resources:
       DefaultRouteSettings:
         ThrottlingBurstLimit: 50
         ThrottlingRateLimit: 20
+      # ADR-001: OIDC/JWT authorizer for the Kiro IDE routes. The Jira
+      # POST /webhook route sets NO Authorizer (so it stays on shared-secret/HMAC
+      # verification), and DefaultAuthorizer is intentionally left unset so a
+      # route is only protected when it opts in via Auth.Authorizer. API Gateway
+      # verifies the token (issuer + audience) before IngressFunction /
+      # StatusFunction run; the Lambda only reads the verified claims.
+      Auth:
+        Authorizers:
+          OidcJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Ref OidcIssuerUrl
+              audience: !Ref OidcAudience
+
+  # ---------------------------------------------------------------------------
+  # ADR-007 D: cost guardrail — ALERT-ONLY budget (NOT a hard fail-closed cap).
+  # -----------------------------------------------------------------------------
+  # Notifies the SNS topic when actual monthly spend crosses the alert
+  # threshold. A HARD dispatch/spend cap that fails closed is DEFERRED on
+  # purpose: it can block legitimate work, so we start alert-only and revisit
+  # once real usage is observed. Only created when an SNS topic ARN is supplied.
+  SpendBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudgetTopic
+    Properties:
+      Budget:
+        BudgetName: kiro-minions-monthly-spend
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertSnsTopicArn
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertSnsTopicArn
 
 # =============================================================================
 # AgentCore Runtime execution role — NOT managed by this stack.
@@ -223,6 +427,16 @@ Outputs:
   WebhookUrl:
     Description: API Gateway endpoint to configure as the Jira webhook target.
     Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
+  TasksIngressUrl:
+    Description: >
+      Kiro IDE ingress endpoint (POST, OIDC/JWT auth). The IDE extension sends a
+      task request here with a Bearer token.
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/tasks"
+  TaskStatusUrlTemplate:
+    Description: >
+      Status polling endpoint template (GET, OIDC/JWT auth). Substitute
+      {task_id} with the id returned by POST /tasks and poll until terminal.
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/tasks/{task_id}"
   JobsTableName:
     Description: DynamoDB idempotency / job-status table name.
     Value: !Ref JobsTable

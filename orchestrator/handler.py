@@ -63,9 +63,11 @@ import boto3
 from botocore.exceptions import ClientError
 
 from parser import (
+    IdeRequestError,
     extract_sonar_hash,
     has_sonarqube_label,
     parse_description_header,
+    parse_ide_request,
     repo_allowed,
 )
 
@@ -101,6 +103,31 @@ def _parse_allowlist(raw: str) -> list[str]:
 
 
 REPO_ALLOWLIST = _parse_allowlist(os.environ.get("REPO_ALLOWLIST", ""))
+
+# Per-actor dispatch quota (ADR-007 C). Limits how many IDE tasks a single
+# developer identity (``actor`` from the verified JWT claims) can dispatch per
+# FIXED window (a tumbling window that resets at each boundary — see
+# ``_quota_window_start``), so one developer or a buggy extension cannot flood
+# the pipeline (scaled parallelism = scaled cost + blast radius). Enforced in
+# ``handler_ide`` after a successful idempotency claim and BEFORE any enqueue,
+# via a DynamoDB-backed atomic counter (so idempotent retries do not consume a
+# slot — review finding #1).
+#
+#   ACTOR_QUOTA_MAX            — max dispatches per actor per window.
+#                                0 / unset => UNLIMITED (quota disabled), which
+#                                keeps existing/unconfigured deployments working.
+#   ACTOR_QUOTA_WINDOW_SECONDS — the fixed-window length in seconds (default 1h).
+#
+# The counter is a dedicated item on the SAME JobsTable keyed by the physical
+# ``sonar_hash`` attribute as ``quota#<actor>#<window_start>`` with a TTL on
+# ``lease_expires_at`` (reused as the table's TTL attribute) so expired windows
+# are swept automatically. A counter-backend error is treated as fail-OPEN (the
+# dispatch proceeds) so a transient DynamoDB blip cannot wedge the whole ingress
+# path; the error is logged redacted.
+ACTOR_QUOTA_MAX = int(os.environ.get("ACTOR_QUOTA_MAX", "0"))
+ACTOR_QUOTA_WINDOW_SECONDS = int(
+    os.environ.get("ACTOR_QUOTA_WINDOW_SECONDS", "3600")
+)
 
 # Environment variables whose VALUES must never appear in a response body or log
 # line. These are usually NOT present in the orchestrator's environment, so this
@@ -143,6 +170,26 @@ STATUS_TESTS_FAILED = "tests_failed"
 # ``done`` (and a live in_flight lease) blocks; ``failed`` and ``tests_failed``
 # are retryable.
 _BLOCKING_STATUSES = {STATUS_IN_FLIGHT, STATUS_DONE}
+
+# Coarse progress phase (ADR-003) stored alongside ``status`` so the IDE can
+# show "queued -> cloning -> fixing -> testing -> opening_pr -> <terminal>".
+# These string values MUST stay in sync with the runtime (runtime/agent.py:
+# PHASE_* and PHASE_FOR_STATUS); a test asserts equality. The orchestrator sets
+# phase="queued" on claim; the runtime emits the intermediate phases and a
+# terminal phase mapped from the terminal status it writes.
+PHASE_QUEUED = "queued"
+PHASE_CLONING = "cloning"
+PHASE_FIXING = "fixing"
+PHASE_TESTING = "testing"
+PHASE_OPENING_PR = "opening_pr"
+# Terminal phase mapping aligned to the existing terminal statuses. A terminal
+# status is also surfaced as a terminal phase so the IDE sees a single coherent
+# progress field.
+PHASE_FOR_STATUS = {
+    STATUS_DONE: "done",
+    STATUS_FAILED: "failed",
+    STATUS_TESTS_FAILED: "tests_failed",
+}
 
 _dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 _agentcore = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
@@ -316,8 +363,19 @@ def _extract_body(event: dict) -> dict:
     raise ValueError(f"unsupported body type: {type(body)!r}")
 
 
-def _claim_job(sonar_hash: str, ticket_id: str) -> bool:
-    """Atomically claim a job for this sonar_hash.
+def _claim_job(sonar_hash: str, ticket_id: str, extra: dict | None = None) -> bool:
+    """Atomically claim a job for this logical task_id / sonar_hash.
+
+    ``sonar_hash`` is the LOGICAL task_id (ADR-004): for the Jira path it is the
+    SonarQube hash (1:1, unchanged behaviour); for the IDE path it is the
+    derived/supplied task_id. Either way it is written into the PHYSICAL DynamoDB
+    partition-key attribute ``sonar_hash`` (no migration), so the lease /
+    reclaim ConditionExpression and ``_mark_status`` are reused unchanged and the
+    runtime (which writes status keyed by ``sonar_hash``) updates the same row.
+
+    ``extra`` carries additional attributes to persist on the claimed row (e.g.
+    ``source`` / ``actor`` for an IDE task). It must not override the managed
+    bookkeeping fields.
 
     Returns True if we acquired the claim (new or previously-failed), False if a
     blocking record (in_flight / done) already exists -> caller should skip.
@@ -329,10 +387,17 @@ def _claim_job(sonar_hash: str, ticket_id: str) -> bool:
         "sonar_hash": sonar_hash,
         "ticket_id": ticket_id,
         "status": STATUS_IN_FLIGHT,
+        # Coarse progress phase (ADR-003): a freshly claimed job is "queued"
+        # until the runtime starts emitting intermediate phase writes. Set for
+        # BOTH the Jira and IDE claim paths (both go through _claim_job).
+        "phase": PHASE_QUEUED,
         "created_at": now,
         "updated_at": now,
         "lease_expires_at": lease_expires_at,
     }
+    if extra:
+        for k, v in extra.items():
+            item.setdefault(k, v)
     # A claim succeeds when one of these holds:
     #   * the item does not exist yet,
     #   * its status is "failed" (a previous run failed -> retry allowed),
@@ -391,6 +456,152 @@ def _mark_status(sonar_hash: str, status: str, extra: dict | None = None) -> Non
         pass
 
 
+# ---------------------------------------------------------------------------
+# Audit log of dispatch decisions (ADR-007 E)
+#
+# Every dispatch decision — in BOTH the Jira ``handler`` and the IDE
+# ``handler_ide`` — emits one structured, REDACTED audit record so operators can
+# answer "who dispatched what, when, and what happened" for multi-tenant
+# accountability and cost/abuse debugging. v1 is a single redacted JSON log line
+# via print() (matching the existing redact()/print() logging style); a
+# DynamoDB audit item is a deferred follow-up. Every string field is routed
+# through redact() so no secret (GITHUB_TOKEN / KIRO_API_KEY / WEBHOOK_SECRET)
+# can ever reach the audit output.
+# ---------------------------------------------------------------------------
+
+# Claim-outcome values recorded in the audit log.
+AUDIT_CLAIMED = "claimed"
+AUDIT_SKIPPED = "skipped"
+AUDIT_QUOTA_EXCEEDED = "quota_exceeded"
+AUDIT_REJECTED = "rejected"
+
+
+def _audit(outcome: str, *, source: str, actor: str = "", task_id: str = "",
+           repo: str = "", reason: str = "") -> None:
+    """Emit one redacted, structured audit record for a dispatch decision.
+
+    ``outcome`` is one of the AUDIT_* values. The record carries who (actor),
+    what (task_id, repo, source), when (timestamp), the claim outcome, and an
+    optional short reason. Best-effort: never raises, so audit logging cannot
+    break the request path. All free-text is routed through redact().
+    """
+    record = {
+        "audit": "dispatch_decision",
+        "ts": int(time.time()),
+        "source": source,
+        "actor": redact(actor) or "",
+        "task_id": redact(task_id) or "",
+        "repo": redact(repo) or "",
+        "outcome": outcome,
+    }
+    if reason:
+        record["reason"] = redact(reason)
+    try:
+        print(json.dumps(record))
+    except Exception:  # noqa: BLE001 - audit logging must never break dispatch
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Per-actor dispatch quota (ADR-007 C)
+# ---------------------------------------------------------------------------
+
+
+# Structured marker emitted whenever the per-actor quota FAILS OPEN (ADR-007 C,
+# review finding #2). It is a distinct, machine-greppable JSON line (not the
+# generic redacted print) so a CloudWatch metric filter / alarm can fire on it:
+# the quota exists specifically to bound scaled cost/blast radius, so the moment
+# it silently stops enforcing is exactly when an operator wants a signal. The
+# ``reason`` disambiguates a backend error from an unreadable counter read.
+QUOTA_FAIL_OPEN_EVENT = "quota_fail_open"
+
+
+def _emit_quota_fail_open(actor: str, reason: str) -> None:
+    """Emit one structured, greppable, redacted quota fail-open signal.
+
+    Best-effort: never raises (a logging failure must not wedge dispatch). The
+    distinct ``event`` key lets a CloudWatch metric filter count these and alarm
+    so fail-open is OBSERVABLE, not buried in a generic log line. Carries no
+    secret (actor + reason are routed through redact()).
+    """
+    record = {
+        "event": QUOTA_FAIL_OPEN_EVENT,
+        "ts": int(time.time()),
+        "actor": redact(actor) or "",
+        "reason": redact(reason) or "",
+    }
+    try:
+        print(json.dumps(record))
+    except Exception:  # noqa: BLE001 - observability must never break dispatch
+        pass
+
+
+def _quota_window_start(now: int) -> int:
+    """Return the start timestamp of the FIXED quota window containing ``now``.
+
+    This is a FIXED (tumbling) window, not a rolling/sliding one: ``now //
+    window`` buckets time into contiguous fixed windows and the per-actor
+    allowance resets hard at each window boundary. (A rolling window would
+    instead count dispatches in the trailing ``window`` seconds from ``now``.)
+    Fixed is intentional for v1 — it is a single atomic counter per
+    actor+window, cheap and race-free; a sliding window would need per-dispatch
+    timestamps and a range read.
+    """
+    window = ACTOR_QUOTA_WINDOW_SECONDS if ACTOR_QUOTA_WINDOW_SECONDS > 0 else 1
+    return (now // window) * window
+
+
+def _check_actor_quota(actor: str) -> bool:
+    """Atomically count this dispatch against the actor's quota window.
+
+    Returns True when the dispatch is WITHIN the quota (or the quota is
+    disabled), False when the actor has EXCEEDED the limit for the current
+    window (caller returns 429 before any enqueue).
+
+    Implementation: an atomic ``UpdateItem ADD`` on a dedicated counter item
+    keyed by ``quota#<actor>#<window_start>`` on the physical ``sonar_hash``
+    attribute of the JobsTable, with a TTL so expired FIXED windows are swept.
+    The ADD returns the post-increment value (ReturnValues=UPDATED_NEW); if it
+    exceeds ACTOR_QUOTA_MAX the actor is over the limit. A backend error is
+    fail-OPEN (returns True) so a transient DynamoDB blip cannot wedge the
+    ingress path; the fail-open is emitted as a distinct, greppable signal
+    (``_emit_quota_fail_open``) so an operator can alarm on a sustained fault
+    that silently removes the abuse ceiling (finding #2). The signal carries no
+    secret (routed through redact()).
+    """
+    if ACTOR_QUOTA_MAX <= 0:
+        # Quota disabled / unlimited.
+        return True
+
+    now = int(time.time())
+    window_start = _quota_window_start(now)
+    counter_key = f"quota#{actor}#{window_start}"
+    # TTL a little past the end of the window so DynamoDB sweeps stale counters.
+    ttl = window_start + ACTOR_QUOTA_WINDOW_SECONDS + 60
+
+    table = _dynamodb.Table(DYNAMODB_TABLE)
+    try:
+        resp = table.update_item(
+            Key={"sonar_hash": counter_key},
+            UpdateExpression="ADD #c :one SET #t = :ttl",
+            ExpressionAttributeNames={"#c": "count", "#t": "lease_expires_at"},
+            ExpressionAttributeValues={":one": 1, ":ttl": ttl},
+            ReturnValues="UPDATED_NEW",
+        )
+    except ClientError as exc:
+        # Fail open: a counter-backend error must not wedge the request path,
+        # but emit an observable signal so the lost ceiling can be alarmed on.
+        _emit_quota_fail_open(actor, f"counter backend error: {exc}")
+        return True
+
+    count = (resp or {}).get("Attributes", {}).get("count")
+    if count is None:
+        # Could not read back the post-increment value -> fail open (observable).
+        _emit_quota_fail_open(actor, "counter post-increment value unreadable")
+        return True
+    return count <= ACTOR_QUOTA_MAX
+
+
 def _build_payload(ticket_id: str, summary: str, description: str,
                    header: dict, sonar_hash: str) -> dict:
     """Assemble the TicketPayload contract object.
@@ -401,7 +612,11 @@ def _build_payload(ticket_id: str, summary: str, description: str,
     ticket_url = (
         f"{JIRA_BASE_URL}/browse/{ticket_id}" if JIRA_BASE_URL and ticket_id else ""
     )
+    # TaskPayload superset (ADR-005): additive source/actor; every runtime-read
+    # field name is unchanged. The Jira path emits source="jira" (actor empty).
     return {
+        "source": "jira",
+        "actor": "",
         "ticket_id": ticket_id,
         "summary": summary,
         "description": description,
@@ -410,8 +625,55 @@ def _build_payload(ticket_id: str, summary: str, description: str,
         "base_branch": header["base_branch"],
         "fix_branch": header["fix_branch"],
         "file_to_fix": header["file_to_fix"],
+        # Jira tickets are always scoped one-shot fixes (ADR-002 Option C): the
+        # runtime keeps selecting the proven deterministic pipeline.
+        "task_type": "one_shot",
         "sonar_hash": sonar_hash,
     }
+
+
+def _build_ide_payload(mapped: dict) -> dict:
+    """Assemble the TaskPayload (JSON) for an IDE task (source="kiro-ide").
+
+    ``mapped`` comes from ``parse_ide_request``. The derived/supplied logical
+    ``task_id`` is carried in the existing ``sonar_hash`` field (ADR-004/005) so
+    the runtime writes status back to the same claimed row with NO wire change:
+    runtime/agent.py keys ``write_job_status`` on ``sonar_hash`` and falls back
+    to ``fix_branch`` derived from ``sonar_hash``. Jira-only fields
+    (``ticket_url`` / ``ticket_id``) are empty for an IDE task.
+    """
+    task_id = mapped["task_id"]
+    # Task-type discriminator (ADR-002 Option C / ADR-005): ``one_shot``
+    # (default, unchanged one-shot pipeline) or ``spec`` (whole tasks.md ->
+    # spec-executor worker). Default to one_shot for safety if a mapper somehow
+    # omits it, so the runtime keeps selecting the proven one-shot path.
+    task_type = mapped.get("task_type") or "one_shot"
+    payload = {
+        "source": "kiro-ide",
+        "actor": mapped["actor"],
+        "ticket_id": "",
+        "summary": mapped["summary"],
+        "description": mapped["description"],
+        "ticket_url": "",
+        "repo_clone_url": mapped["repo_clone_url"],
+        "base_branch": mapped["base_branch"],
+        "fix_branch": mapped["fix_branch"],
+        "file_to_fix": mapped["file_to_fix"],
+        "acceptance": mapped["acceptance"],
+        "task_type": task_type,
+        # Logical task_id carried in the physical partition-key field so the
+        # runtime writes status back to the same row (no runtime wire change).
+        "sonar_hash": task_id,
+    }
+    # Spec-only source fields: carry them only when present so a one_shot
+    # payload stays byte-for-byte compatible with the existing contract.
+    tasks_md_path = mapped.get("tasks_md_path")
+    if tasks_md_path is not None:
+        payload["tasks_md_path"] = tasks_md_path
+    tasks_md = mapped.get("tasks_md")
+    if tasks_md is not None:
+        payload["tasks_md"] = tasks_md
+    return payload
 
 
 def _invoke_runtime(payload: dict) -> str:
@@ -552,6 +814,8 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     # wedges a sonar_hash or reaches the work queue. owner/repo is not a secret,
     # so it is safe to name in the reason (still routed through redact()).
     if not repo_allowed(header["repo_clone_url"], REPO_ALLOWLIST):
+        _audit(AUDIT_REJECTED, source="jira", task_id=sonar_hash,
+               repo=header["repo_clone_url"], reason="repo not in allowlist")
         return _response(
             403,
             {"error": redact(
@@ -563,9 +827,14 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     try:
         claimed = _claim_job(sonar_hash, ticket_id)
     except ClientError as exc:
+        _audit(AUDIT_REJECTED, source="jira", task_id=sonar_hash,
+               repo=header["repo_clone_url"], reason=f"dynamodb error: {exc}")
         return _response(500, {"error": redact(f"dynamodb error: {exc}")})
 
     if not claimed:
+        _audit(AUDIT_SKIPPED, source="jira", task_id=sonar_hash,
+               repo=header["repo_clone_url"],
+               reason="job already in_flight or done")
         return _response(
             200,
             {
@@ -585,6 +854,8 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
         # the job failed so a later webhook can retry, then report a redacted
         # 500. The reason string is redacted and carries no runtime output.
         _mark_status(sonar_hash, STATUS_FAILED, {"error": redact(str(exc))})
+        _audit(AUDIT_REJECTED, source="jira", task_id=sonar_hash,
+               repo=header["repo_clone_url"], reason=f"enqueue failed: {exc}")
         return _response(
             500, {"error": redact(f"enqueue failed: {exc}")}
         )
@@ -592,6 +863,8 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
     # The webhook returns 202 the moment the payload is enqueued. It carries no
     # runtime output and no secret — the terminal job result is surfaced via the
     # DynamoDB job status the runtime writes itself, not the HTTP body.
+    _audit(AUDIT_CLAIMED, source="jira", task_id=sonar_hash,
+           repo=header["repo_clone_url"])
     return _response(
         202,
         {
@@ -600,3 +873,328 @@ def handler(event, context):  # noqa: ANN001 - Lambda signature
             "ticket_id": ticket_id,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Kiro IDE ingress (FEAT-002)
+#
+# A second ingress for per-developer IDE tasks (specs/ide-ingress.md). It sits
+# behind an API Gateway HTTP API JWT authorizer (ADR-001), so API Gateway has
+# already VERIFIED the token before this Lambda runs; we only READ the verified
+# claims (sub/email -> actor) and never re-verify the signature. We DO fail
+# closed (401) if no verified claims are present. Everything downstream (the
+# logical-task_id claim on the existing table, the SQS JobsQueue, the runtime)
+# is reused unchanged — only the ingress + payload mapping are new.
+# ---------------------------------------------------------------------------
+
+
+def _extract_jwt_claims(event: dict) -> dict:
+    """Return the verified JWT claims from an HTTP API event, lowercased keys.
+
+    Tolerates two shapes:
+      * API Gateway HTTP API v2: ``event.requestContext.authorizer.jwt.claims``
+        (the authorizer already verified the token, so these claims are trusted).
+      * A direct-dict test shape: a top-level ``claims`` mapping.
+
+    Returns an empty dict when no verified claims are present (the caller fails
+    closed with 401). Never raises.
+    """
+    if not isinstance(event, dict):
+        return {}
+
+    claims = None
+    request_context = event.get("requestContext")
+    if isinstance(request_context, dict):
+        authorizer = request_context.get("authorizer")
+        if isinstance(authorizer, dict):
+            jwt = authorizer.get("jwt")
+            if isinstance(jwt, dict):
+                claims = jwt.get("claims")
+            # Some authorizer shapes put claims directly under authorizer.
+            if claims is None and isinstance(authorizer.get("claims"), dict):
+                claims = authorizer.get("claims")
+
+    # Direct-dict test shape.
+    if claims is None and isinstance(event.get("claims"), dict):
+        claims = event.get("claims")
+
+    if not isinstance(claims, dict):
+        return {}
+    return {str(k).lower(): v for k, v in claims.items()}
+
+
+def _actor_from_claims(claims: dict) -> str:
+    """Derive the actor identity from verified JWT claims (sub/email).
+
+    Prefers ``sub`` (stable subject), falls back to ``email``. Returns an empty
+    string when neither is present (the caller fails closed with 401).
+    """
+    for key in ("sub", "email"):
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
+    """Lambda entry point for the Kiro IDE task ingress (POST /tasks).
+
+    Flow:
+      1. Read the verified JWT claims (401 if no actor identity).
+      2. Parse + map the IDE request body to TaskPayload fields (400 on invalid
+         clone URL / branch / missing required field).
+      3. Enforce the repo allowlist (403) BEFORE any claim/enqueue, matching the
+         Jira path ordering.
+      4. Derive the logical task_id (already done by the parser) and claim it on
+         the existing table (200 skipped if blocked — a skipped claim is an
+         idempotent retry and does NOT consume quota).
+      4b. Only on a SUCCESSFUL (new) claim, count the dispatch against the
+         per-actor quota (429 over the limit, releasing the claim). Quota runs
+         after the claim so idempotent retries never erode it (finding #1), but
+         still strictly before any enqueue of genuinely new work.
+      5. Build the TaskPayload (source="kiro-ide", actor set) and enqueue onto
+         the existing SQS JobsQueue; on enqueue failure mark failed + redacted
+         500.
+      6. Return 202 {status: "accepted", task_id, actor}. No secret or raw
+         runtime output in the response.
+    """
+    # --- Authenticate: read verified JWT claims (fail closed) ---
+    claims = _extract_jwt_claims(event)
+    actor = _actor_from_claims(claims)
+    if not actor:
+        _audit(AUDIT_REJECTED, source="kiro-ide",
+               reason="missing verified developer identity")
+        return _response(401, {"error": "missing verified developer identity"})
+
+    # --- Parse the IDE request body ---
+    try:
+        body = _extract_body(event)
+    except (ValueError, json.JSONDecodeError) as exc:
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor,
+               reason=f"invalid request body: {exc}")
+        return _response(400, {"error": redact(f"invalid request body: {exc}")})
+
+    # --- Validate + map the request to TaskPayload fields ---
+    try:
+        mapped = parse_ide_request(body, actor)
+    except (IdeRequestError, ValueError) as exc:
+        # IdeRequestError covers missing/invalid request fields; the reused
+        # validate_clone_url / validate_branch_name raise plain ValueError on a
+        # bad URL / branch. Both are client errors -> redacted 400.
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor,
+               reason=f"invalid request: {exc}")
+        return _response(400, {"error": redact(str(exc))})
+
+    task_id = mapped["task_id"]
+    repo_clone_url = mapped["repo_clone_url"]
+
+    # --- Repo allowlist gate (before any claim/enqueue, like the Jira path) ---
+    if not repo_allowed(repo_clone_url, REPO_ALLOWLIST):
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor, task_id=task_id,
+               repo=repo_clone_url, reason="repo not in allowlist")
+        return _response(
+            403,
+            {"error": redact(f"repo not in allowlist: {repo_clone_url}")},
+        )
+
+    # --- Idempotency claim (logical task_id -> physical sonar_hash attr) ---
+    # The claim runs BEFORE the quota check (review finding #1): an idempotent
+    # re-dispatch of an already-claimed/done task_id returns 200 "skipped" with
+    # NO new work enqueued, so it must NOT consume a quota slot. Only a
+    # SUCCESSFUL claim (genuinely new work) is counted against the quota below,
+    # which still gates strictly before any enqueue.
+    try:
+        claimed = _claim_job(
+            task_id, task_id, extra={"source": "kiro-ide", "actor": actor}
+        )
+    except ClientError as exc:
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor, task_id=task_id,
+               repo=repo_clone_url, reason=f"dynamodb error: {exc}")
+        return _response(500, {"error": redact(f"dynamodb error: {exc}")})
+
+    if not claimed:
+        # Skipped claim: no new work, no quota consumed. This is the idempotent
+        # retry path (double-click / dropped 202) — returning 429 here would
+        # wrongly block a user from retrying the SAME task they already queued.
+        _audit(AUDIT_SKIPPED, source="kiro-ide", actor=actor, task_id=task_id,
+               repo=repo_clone_url,
+               reason="task already in_flight or done")
+        return _response(
+            200,
+            {
+                "status": "skipped",
+                "reason": "task already in_flight or done for this task_id",
+                "task_id": task_id,
+            },
+        )
+
+    # --- Per-actor dispatch quota (ADR-007 C), AFTER a successful claim and
+    # BEFORE any enqueue ---
+    # Count this NEW dispatch against the actor's fixed (tumbling) window. Over
+    # the limit -> 429 with a redacted reason and NO enqueue. Because this runs only after
+    # a fresh claim, idempotent retries of an existing task_id never erode the
+    # quota (finding #1). Over the limit we release the just-made claim (mark it
+    # failed) so the task_id stays retryable rather than wedged in_flight. The
+    # quota is disabled when ACTOR_QUOTA_MAX is 0/unset.
+    if not _check_actor_quota(actor):
+        _mark_status(task_id, STATUS_FAILED,
+                     {"reason": redact("per-actor dispatch quota exceeded")})
+        _audit(AUDIT_QUOTA_EXCEEDED, source="kiro-ide", actor=actor,
+               task_id=task_id, repo=repo_clone_url,
+               reason="per-actor dispatch quota exceeded")
+        return _response(
+            429,
+            {"error": redact("per-actor dispatch quota exceeded"),
+             "task_id": task_id},
+        )
+
+    # --- Build the TaskPayload and enqueue for the consumer ---
+    payload = _build_ide_payload(mapped)
+
+    try:
+        _enqueue_payload(payload)
+    except Exception as exc:  # noqa: BLE001 - report any enqueue failure
+        # Enqueue failed before any work started: release the claim by marking
+        # the task failed so a later dispatch can retry, then report a redacted
+        # 500. The reason string is redacted and carries no runtime output.
+        _mark_status(task_id, STATUS_FAILED, {"error": redact(str(exc))})
+        _audit(AUDIT_REJECTED, source="kiro-ide", actor=actor, task_id=task_id,
+               repo=repo_clone_url, reason=f"enqueue failed: {exc}")
+        return _response(500, {"error": redact(f"enqueue failed: {exc}")})
+
+    _audit(AUDIT_CLAIMED, source="kiro-ide", actor=actor, task_id=task_id,
+           repo=repo_clone_url)
+    return _response(
+        202,
+        {
+            "status": "accepted",
+            "task_id": task_id,
+            "actor": actor,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Status polling API (FEAT-003 / ADR-003)
+#
+# A READ-ONLY Lambda serving GET /tasks/{task_id}. The IDE polls it every few
+# seconds until a terminal status. It sits behind the SAME JWT authorizer as the
+# ingress (ADR-001): API Gateway has already verified the token, so we only READ
+# the verified claims and fail closed (401) when no identity is present. This
+# endpoint performs NO claim / enqueue / mutation — it only reads the existing
+# status row the runtime (and _claim_job) write.
+#
+# The logical ``task_id`` path parameter is read against the PHYSICAL partition
+# key attribute ``sonar_hash`` (ADR-004: task_id is the logical alias, the
+# attribute name never changed). Any free-text ``reason`` is routed through
+# redact() so a secret can never leak back to the IDE.
+# ---------------------------------------------------------------------------
+
+
+def _extract_task_id(event: dict) -> str:
+    """Return the ``task_id`` path parameter from an HTTP API event.
+
+    Tolerates the API Gateway HTTP API v2 shape (``event.pathParameters`` and
+    ``event.requestContext.pathParameters``) and a direct-dict test shape
+    (a top-level ``task_id``). Returns an empty string when absent. Never raises.
+    """
+    if not isinstance(event, dict):
+        return ""
+
+    # Direct-dict test shape.
+    direct = event.get("task_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    for container in (event.get("pathParameters"),):
+        if isinstance(container, dict):
+            value = container.get("task_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    request_context = event.get("requestContext")
+    if isinstance(request_context, dict):
+        path_params = request_context.get("pathParameters")
+        if isinstance(path_params, dict):
+            value = path_params.get("task_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ""
+
+
+def status_handler(event, context):  # noqa: ANN001 - Lambda signature
+    """Lambda entry point for GET /tasks/{task_id} (read-only status poll).
+
+    Flow:
+      1. Require a verified JWT identity (401 if absent), reusing the FEAT-002
+         claims helper.
+      2. Read the ``task_id`` path parameter (400 if missing).
+      3. Read the status row from DynamoDB by the logical task_id (physical
+         ``sonar_hash`` attribute). 404 when the row does not exist.
+      4. Return a stable JSON contract: {task_id, status, phase?, pr_url? (when
+         done), reason? (REDACTED, when failed/tests_failed), updated_at?}.
+
+    No mutation of any kind happens here.
+    """
+    # --- Authenticate: read verified JWT claims (fail closed) ---
+    claims = _extract_jwt_claims(event)
+    actor = _actor_from_claims(claims)
+    if not actor:
+        return _response(401, {"error": "missing verified developer identity"})
+
+    task_id = _extract_task_id(event)
+    if not task_id:
+        return _response(400, {"error": "missing task_id path parameter"})
+
+    # --- Read the status row (read-only) ---
+    try:
+        table = _dynamodb.Table(DYNAMODB_TABLE)
+        result = table.get_item(Key={"sonar_hash": task_id})
+    except ClientError as exc:
+        return _response(500, {"error": redact(f"dynamodb error: {exc}")})
+
+    item = (result or {}).get("Item")
+    if not item:
+        return _response(404, {"error": "task not found", "task_id": task_id})
+
+    # --- Per-actor ownership scoping for IDE-sourced tasks (finding #3) ---
+    # An IDE task row records the dispatching ``actor``; a verified identity may
+    # only read its OWN IDE tasks. This closes the "any verified identity can
+    # read any task_id" gap without relying solely on task_ids being
+    # unguessable. We return 404 (not 403) so the endpoint does not confirm the
+    # existence of another tenant's task_id. Jira-sourced rows (source != kiro-
+    # ide, actor empty) stay readable by any verified identity — the Jira path
+    # has no per-developer owner, so this preserves its existing behaviour.
+    if item.get("source") == "kiro-ide":
+        owner = item.get("actor") or ""
+        if owner and owner != actor:
+            return _response(
+                404, {"error": "task not found", "task_id": task_id}
+            )
+
+    status = item.get("status", "")
+    body: dict = {"task_id": task_id, "status": status}
+
+    phase = item.get("phase")
+    if phase:
+        body["phase"] = phase
+    updated_at = item.get("updated_at")
+    if updated_at is not None:
+        body["updated_at"] = updated_at
+
+    # Surface the PR link only once the job is done.
+    if status == STATUS_DONE:
+        pr_url = item.get("pr_url")
+        if pr_url:
+            body["pr_url"] = pr_url
+
+    # Surface a redacted reason for non-success terminal states.
+    if status in (STATUS_FAILED, STATUS_TESTS_FAILED):
+        reason = item.get("reason")
+        if reason is not None:
+            # The runtime already redacts, but redact again here as defence in
+            # depth so a secret can never leak back to the IDE.
+            body["reason"] = redact(reason)
+
+    return _response(200, body)

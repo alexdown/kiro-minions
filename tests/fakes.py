@@ -222,19 +222,28 @@ class FakeDynamoTable:
                     ConditionExpression: str | None = None,  # noqa: N803
                     ExpressionAttributeNames: dict | None = None,  # noqa: N803
                     ExpressionAttributeValues: dict | None = None,  # noqa: N803
+                    ReturnValues: str | None = None,  # noqa: N803
                     **kwargs: Any) -> dict:
         self._record("update_item", Key=Key, UpdateExpression=UpdateExpression,
                      ConditionExpression=ConditionExpression,
                      ExpressionAttributeNames=ExpressionAttributeNames,
-                     ExpressionAttributeValues=ExpressionAttributeValues)
+                     ExpressionAttributeValues=ExpressionAttributeValues,
+                     ReturnValues=ReturnValues)
         key = Key.get(self.key_attr)
         if ConditionExpression and not self._condition_holds(
                 key, ConditionExpression, ExpressionAttributeNames,
                 ExpressionAttributeValues):
             raise _conditional_check_failed()
         item = self.items.setdefault(key, dict(Key))
-        self._apply_set(item, UpdateExpression, ExpressionAttributeNames or {},
-                        ExpressionAttributeValues or {})
+        expr_names = ExpressionAttributeNames or {}
+        expr_values = ExpressionAttributeValues or {}
+        updated = self._apply_update(item, UpdateExpression, expr_names,
+                                     expr_values)
+        # Minimal ReturnValues support: UPDATED_NEW returns the attributes that
+        # the expression touched (enough for the FEAT-004 quota counter, which
+        # reads back the post-increment value via an atomic ADD).
+        if ReturnValues == "UPDATED_NEW":
+            return {"Attributes": {k: item[k] for k in updated if k in item}}
         return {}
 
     def get_item(self, Key: dict, **kwargs: Any) -> dict:  # noqa: N803
@@ -243,20 +252,78 @@ class FakeDynamoTable:
         item = self.items.get(key)
         return {"Item": dict(item)} if item is not None else {}
 
-    def _apply_set(self, item: dict, update_expr: str, expr_names: dict,
-                   expr_values: dict) -> None:
-        """Apply a ``SET a = :x, b = :y`` update expression."""
-        expr = update_expr.strip()
-        if not expr.upper().startswith("SET"):
-            return
-        assignments = expr[3:].split(",")
-        for assignment in assignments:
+    def _apply_update(self, item: dict, update_expr: str, expr_names: dict,
+                      expr_values: dict) -> list:
+        """Apply a DynamoDB update expression; return the attrs it touched.
+
+        Supports the small subset the production code uses: a single ``SET``
+        clause (``SET a = :x, b = :y``) and/or a single ``ADD`` clause
+        (``ADD #c :one, #t :ttl``). ADD increments a numeric attribute
+        atomically (absent attribute treated as 0), which the FEAT-004 per-actor
+        quota counter relies on.
+        """
+        expr = (update_expr or "").strip()
+        touched: list = []
+        # Split the expression into its clauses by the leading keyword of each.
+        clauses = self._split_update_clauses(expr)
+        for keyword, body in clauses:
+            if keyword == "SET":
+                touched.extend(self._apply_set_body(item, body, expr_names,
+                                                    expr_values))
+            elif keyword == "ADD":
+                touched.extend(self._apply_add_body(item, body, expr_names,
+                                                    expr_values))
+        return touched
+
+    @staticmethod
+    def _split_update_clauses(expr: str) -> list:
+        """Split an update expression into [(KEYWORD, body), ...] pairs."""
+        tokens = expr.split()
+        clauses: list = []
+        keywords = {"SET", "ADD", "REMOVE", "DELETE"}
+        current_kw = None
+        current_parts: list = []
+        for tok in tokens:
+            if tok.upper() in keywords:
+                if current_kw is not None:
+                    clauses.append((current_kw, " ".join(current_parts)))
+                current_kw = tok.upper()
+                current_parts = []
+            else:
+                current_parts.append(tok)
+        if current_kw is not None:
+            clauses.append((current_kw, " ".join(current_parts)))
+        return clauses
+
+    def _apply_set_body(self, item: dict, body: str, expr_names: dict,
+                        expr_values: dict) -> list:
+        touched: list = []
+        for assignment in body.split(","):
             if "=" not in assignment:
                 continue
             target, value_token = (s.strip() for s in assignment.split("=", 1))
             attr = expr_names.get(target, target)
             value = expr_values.get(value_token, value_token)
             item[attr] = value
+            touched.append(attr)
+        return touched
+
+    def _apply_add_body(self, item: dict, body: str, expr_names: dict,
+                        expr_values: dict) -> list:
+        touched: list = []
+        for part in body.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            pieces = part.split()
+            if len(pieces) != 2:
+                continue
+            target, value_token = pieces
+            attr = expr_names.get(target, target)
+            delta = expr_values.get(value_token, value_token)
+            item[attr] = item.get(attr, 0) + delta
+            touched.append(attr)
+        return touched
 
 
 class FakeDynamoResource:
@@ -635,6 +702,31 @@ def _make_bedrock_agentcore_modules() -> tuple[types.ModuleType, types.ModuleTyp
     pkg.runtime = runtime  # type: ignore[attr-defined]
     pkg.BedrockAgentCoreApp = _FakeBedrockAgentCoreApp  # type: ignore[attr-defined]
     return pkg, runtime
+
+
+def make_ide_jwt_event(body: Any, claims: dict | None = None,
+                       *, json_string_body: bool = True) -> dict:
+    """Build an API Gateway HTTP API v2 event for the IDE ingress.
+
+    Mirrors the event shape the JWT authorizer produces: verified claims live
+    under ``requestContext.authorizer.jwt.claims`` and the request body is a
+    JSON string (as HTTP API delivers it). Pass ``claims=None`` to simulate a
+    request with NO verified identity (handler must fail closed 401). Pure
+    stdlib — no real AWS/API Gateway.
+    """
+    import json as _json
+
+    event: dict = {}
+    if claims is not None:
+        event["requestContext"] = {
+            "authorizer": {"jwt": {"claims": dict(claims)}}
+        }
+    if body is not None:
+        if json_string_body and not isinstance(body, str):
+            event["body"] = _json.dumps(body)
+        else:
+            event["body"] = body
+    return event
 
 
 def install_sdk_stubs() -> None:

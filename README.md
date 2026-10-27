@@ -87,10 +87,144 @@ its own terminal job status back to DynamoDB.
                                                         GitHub PR     DynamoDB (job status)
 ```
 
+## Kiro IDE task ingress (second ingress)
+
+Alongside the Jira webhook, kiro-minions exposes a **second ingress** so a
+developer can dispatch a task straight from the Kiro IDE and have it run on a
+remote worker instead of their laptop (see
+[specs/ide-ingress.md](specs/ide-ingress.md)). It reuses the **same** downstream
+pipeline — the same `JobsQueue`, consumer, AgentCore Runtime, and jobs table —
+so the only new parts are the ingress mapping, an OIDC/JWT authorizer, and a
+read-only status poll. Result delivery is unchanged: the fix still arrives as a
+**GitHub PR** via the existing runtime push+PR mechanism (ADR-006).
+
+> **Naming:** the Jira path has always spoken of a "ticket"; the IDE path speaks
+> of a **task**. These are the same thing on the wire — the shared payload keeps
+> every runtime-read field name unchanged (`ticket_id`, `sonar_hash`, …) and
+> adds `source` / `actor`. "Ticket → Task" is a docs/tests-level naming shift,
+> **not** a wire change. A Jira payload carries `source="jira"`; an IDE payload
+> carries `source="kiro-ide"` and the developer's `actor` identity.
+
+An **IDE task comes in two shapes** (selected by a `task_type` discriminator,
+ADR-002), both with acceptance fixed to **tests pass** in v1:
+
+- **`one_shot`** (the original scoped fix): a natural-language `instruction`
+  (→ the kiro-cli brief) and an optional `target` file/area hint
+  (→ `file_to_fix`). It reuses `runtime/agent.py` unchanged.
+- **`spec`** (the headline IDE shape): a **whole `tasks.md`** produced by a
+  local Kiro spec-driven workflow (`requirements.md` → `design.md` →
+  `tasks.md`, often tens of tasks). The developer offloads the ENTIRE task list
+  to the remote **spec-executor** worker (`runtime/spec_agent.py`), which reads
+  the list and iterates task-by-task: a fresh per-task brief, one commit per
+  completed task on one branch, one PR per spec, and stop-at-first-blocker. The
+  task list is referenced by a repo-relative `tasks_md_path` (read after clone)
+  or passed inline as `tasks_md`. See
+  [specs/spec-executor.md](specs/spec-executor.md).
+
+### Endpoints
+
+Both endpoints sit behind an API Gateway HTTP API **OIDC/JWT authorizer**
+(ADR-001): API Gateway verifies the developer's token (issuer + audience) before
+the Lambda runs, and the Lambda only reads the verified claims (`sub`/`email` →
+`actor`). No request without a valid token reaches the pipeline.
+
+**`POST /tasks`** — dispatch a task. JSON body:
+
+```json
+{
+  "task_type": "one_shot",
+  "repo_clone_url": "https://github.com/your-org/your-repo.git",
+  "description": "Add input validation to the login form.",
+  "summary": "Validate login form input",
+  "base_branch": "main",
+  "file_to_fix": "src/login.js",
+  "idempotency_key": "optional-client-supplied-id"
+}
+```
+
+A **spec** job offloads a whole `tasks.md` instead (see
+[specs/spec-executor.md](specs/spec-executor.md)):
+
+```json
+{
+  "task_type": "spec",
+  "repo_clone_url": "https://github.com/your-org/your-repo.git",
+  "summary": "Execute the checkout-redesign spec",
+  "base_branch": "main",
+  "tasks_md_path": ".kiro/specs/checkout-redesign/tasks.md"
+}
+```
+
+- `task_type` selects the pipeline: `one_shot` (default when absent) or `spec`.
+- For a **one_shot** job, `repo_clone_url`, `description`, `summary` are
+  **required**; `base_branch` (default `main`), `file_to_fix`, `fix_branch`,
+  and `idempotency_key` are optional.
+- For a **spec** job, `repo_clone_url` and `summary` (used for the PR title) are
+  **required** plus EITHER `tasks_md_path` (a traversal-validated repo-relative
+  path, read after clone) OR inline `tasks_md`; `description` is optional (the
+  `tasks.md` is the work). The clone URL and branch names are validated by the
+  **same** strict validators the Jira path uses.
+- **Server-derived `task_id`.** By default the `task_id` is a stable
+  `sha256(actor + repo_clone_url + base_branch + description)` (prefixed
+  `ide-`), so a double-click / dropped-response re-dispatch is idempotent. A
+  client may override it with `idempotency_key`; the override is **constrained**
+  — forced into the `ide-` namespace and matched against
+  `^[A-Za-z0-9._-]{1,128}$` (after an optional leading `ide-`). This rejects
+  `#`, whitespace, and overlong values, so a client-supplied key can never
+  collide with a Jira `sonar_hash` or a per-actor `quota#…` counter on the
+  shared table, nor target another tenant's row via the status API.
+- The logical `task_id` is carried in the **physical `sonar_hash` partition-key
+  attribute** (ADR-004), so the claim/lease logic, the consumer, and the runtime
+  are reused unchanged.
+- Responses: `202 {status: "accepted", task_id, actor}` on dispatch;
+  `200 {status: "skipped"}` when the task is already `in_flight`/`done`;
+  `400` invalid request; `401` no verified identity; `403` repo not in the
+  allowlist; `429` per-actor quota exceeded; `500` (redacted) on a backend error.
+
+**`GET /tasks/{task_id}`** — poll status (read-only; no mutation). The IDE polls
+every few seconds until a terminal status. Returns
+`{task_id, status, phase?, pr_url? (when done), reason? (REDACTED, when
+failed/tests_failed), updated_at?}`. `phase` is a coarse progress field
+(`queued → cloning → fixing → testing → opening_pr → <terminal>`, ADR-003).
+`404` when the task id is unknown. IDE-sourced tasks are **owner-scoped**: a
+verified identity may only read its own IDE tasks (the row records the
+dispatching `actor`); another identity gets `404` (existence is not leaked).
+Jira-sourced rows have no per-developer owner and stay readable by any verified
+identity.
+
+### Per-actor dispatch quota + audit log (ADR-007)
+
+- **Per-actor quota (C).** `POST /tasks` counts a dispatch against the
+  `actor`'s **fixed (tumbling) window** using a DynamoDB-backed atomic counter.
+  The count happens only on a **successful (new) idempotency claim**, after the
+  claim and before the enqueue: an idempotent re-dispatch of an
+  already-`in_flight`/`done` `task_id` returns `200 {status: "skipped"}` and
+  does **not** consume a slot, so retries can't erode a developer's quota or
+  `429` them for the same task. Over the limit returns **`429`** with a redacted
+  reason and performs **no enqueue of new work** (the briefly-claimed row is
+  released to `failed` so it stays retryable). Tuned by `ACTOR_QUOTA_MAX`
+  (0/unset = unlimited, i.e. quota disabled) and `ACTOR_QUOTA_WINDOW_SECONDS`
+  (default `3600`). A counter-backend error **fails open** so a transient
+  DynamoDB blip cannot wedge the ingress path, and emits a distinct, greppable
+  `quota_fail_open` JSON signal so a sustained fault (which silently removes the
+  abuse ceiling) can be alarmed on.
+- **Audit log (E).** Both the Jira `handler` and the IDE `handler_ide` emit one
+  structured, **redacted** audit record per dispatch decision — `actor`,
+  `task_id`, `repo`, `source`, `outcome`
+  (`claimed`/`skipped`/`quota_exceeded`/`rejected`), and a timestamp — via a
+  JSON log line. Every field is routed through `redact()`, so no secret can
+  reach the audit output.
+- **Concurrency + cost (A/B/D).** The template caps the ingress and consumer
+  Lambda concurrency (reserved-concurrency parameters); the consumer cap is the
+  effective AgentCore worker ceiling with **SQS as backpressure** (no extra
+  resource). An **alert-only** AWS Budget notifies an SNS topic on spend — a
+  hard fail-closed cap is **deferred** on purpose.
+
 ## Layout
 
 ```
-orchestrator/   Lambdas: webhook producer (handler.handler) + SQS consumer (handler.sqs_consumer)
+orchestrator/   Lambdas: Jira webhook producer (handler.handler) + IDE ingress (handler.handler_ide)
+                + status poll (handler.status_handler) + SQS consumer (handler.sqs_consumer)
 runtime/        AgentCore Runtime container (Dockerfile + deterministic pipeline script)
 agent/          [LEGACY] Original managed-harness definition (kept for reference)
 specs/          Design docs
@@ -168,8 +302,25 @@ sam deploy \
     JiraBaseUrl=https://your-org.atlassian.net \
     WebhookSecretSsmName=/kiro-minions/webhook-secret \
     RepoAllowlist='your-org/*' \
+    OidcIssuerUrl=https://your-idp.example.com/ \
+    OidcAudience=kiro-minions-ide \
+    ActorQuotaMax=0 \
+    ActorQuotaWindowSeconds=3600 \
+    IngressReservedConcurrency=10 \
+    ConsumerReservedConcurrency=5 \
+    MonthlyBudgetLimit=500 \
+    BudgetAlertSnsTopicArn=arn:aws:sns:us-east-1:123456789012:kiro-minions-alerts \
   --capabilities CAPABILITY_IAM
 ```
+
+The IDE ingress parameters configure the OIDC/JWT authorizer
+(`OidcIssuerUrl`, `OidcAudience`), the per-actor dispatch quota (`ActorQuotaMax`,
+`ActorQuotaWindowSeconds`), the reserved-concurrency guardrails
+(`IngressReservedConcurrency`, `ConsumerReservedConcurrency`), and the
+alert-only budget (`MonthlyBudgetLimit`, `BudgetAlertSnsTopicArn`). The budget
+is only created when an SNS topic ARN is supplied; leave
+`BudgetAlertSnsTopicArn` empty to skip it. Point the IDE extension at the
+`TasksIngressUrl` output and poll the `TaskStatusUrlTemplate` output.
 
 The webhook secret itself is **never** passed on the command line: store it once
 as a SecureString SSM parameter and pass only its *name* via
@@ -204,9 +355,14 @@ following to the Runtime execution role manually:
 
 Resource: the jobs table ARN (the `JobsTableArn` output of the SAM stack).
 
-### 4. Wire the Jira webhook
+### 4. Wire the Jira webhook and the IDE ingress
 
-Point your Jira webhook at the `WebhookUrl` output from the SAM stack.
+Point your Jira webhook at the `WebhookUrl` output from the SAM stack. For the
+Kiro IDE ingress, point the extension at the `TasksIngressUrl` output
+(`POST /tasks`, with an OIDC Bearer token) and poll `TaskStatusUrlTemplate`
+(`GET /tasks/{task_id}`) until a terminal status. The Jira `POST /webhook` route
+keeps its shared-secret/HMAC verification; only the `/tasks` routes require the
+OIDC/JWT token.
 
 ## Credentials
 
@@ -219,7 +375,9 @@ Point your Jira webhook at the `WebhookUrl` output from the SAM stack.
 | `SQS_QUEUE_URL` | Orchestrator (producer) Lambda env | work queue to enqueue TicketPayloads onto |
 | `LEASE_SECONDS` | Orchestrator (producer) Lambda env | claim lease validity (default `3600`); after it expires a stale `in_flight` row is reclaimable |
 | `WEBHOOK_SECRET` | Orchestrator (producer) Lambda env | webhook shared secret / HMAC key (resolved from SSM at deploy; **never** hardcoded). When set, `verify_webhook` **fails closed** (401 for a missing credential header, 403 for an invalid signature/secret); when empty, verification is skipped (fail-open) for local/direct invokes and unconfigured deployments. All compares use `hmac.compare_digest` (constant-time) |
-| `REPO_ALLOWLIST` | Orchestrator (producer) Lambda env | comma/whitespace separated owner/repo glob patterns; a ticket whose repo is not allowed is rejected 403 before any claim/enqueue. Empty = allow all. Re-checked in the runtime |
+| `REPO_ALLOWLIST` | Orchestrator (producer) + Ingress Lambda env | comma/whitespace separated owner/repo glob patterns; a ticket/task whose repo is not allowed is rejected 403 before any claim/enqueue. Empty = allow all. Re-checked in the runtime |
+| `ACTOR_QUOTA_MAX` | Ingress (IDE) Lambda env | max IDE dispatches per developer identity per window. `0`/unset = unlimited (quota disabled). Over the limit returns `429` before any claim/enqueue |
+| `ACTOR_QUOTA_WINDOW_SECONDS` | Ingress (IDE) Lambda env | per-actor quota window length in seconds (default `3600`) |
 
 ### Webhook authentication (`WEBHOOK_SECRET`)
 
@@ -256,3 +414,6 @@ reclaim gate, independent of when the TTL sweeper runs.
 - [specs/overview.md](specs/overview.md) — architecture and design rationale
 - [specs/payload.md](specs/payload.md) — payload schema + ticket parsing
 - [specs/runtime.md](specs/runtime.md) — Runtime container design and deployment
+- [specs/ide-ingress.md](specs/ide-ingress.md) — Kiro IDE task ingress (remote worker hand-off)
+- [specs/spec-executor.md](specs/spec-executor.md) : spec-executor worker (whole `tasks.md` offload, ADR-002 Option C)
+- [specs/adr/README.md](specs/adr/README.md) — Architecture Decision Registry
