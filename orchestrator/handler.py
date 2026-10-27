@@ -146,6 +146,26 @@ STATUS_TESTS_FAILED = "tests_failed"
 # are retryable.
 _BLOCKING_STATUSES = {STATUS_IN_FLIGHT, STATUS_DONE}
 
+# Coarse progress phase (ADR-003) stored alongside ``status`` so the IDE can
+# show "queued -> cloning -> fixing -> testing -> opening_pr -> <terminal>".
+# These string values MUST stay in sync with the runtime (runtime/agent.py:
+# PHASE_* and PHASE_FOR_STATUS); a test asserts equality. The orchestrator sets
+# phase="queued" on claim; the runtime emits the intermediate phases and a
+# terminal phase mapped from the terminal status it writes.
+PHASE_QUEUED = "queued"
+PHASE_CLONING = "cloning"
+PHASE_FIXING = "fixing"
+PHASE_TESTING = "testing"
+PHASE_OPENING_PR = "opening_pr"
+# Terminal phase mapping aligned to the existing terminal statuses. A terminal
+# status is also surfaced as a terminal phase so the IDE sees a single coherent
+# progress field.
+PHASE_FOR_STATUS = {
+    STATUS_DONE: "done",
+    STATUS_FAILED: "failed",
+    STATUS_TESTS_FAILED: "tests_failed",
+}
+
 _dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 _agentcore = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
 _sqs = boto3.client("sqs", region_name=AWS_REGION)
@@ -342,6 +362,10 @@ def _claim_job(sonar_hash: str, ticket_id: str, extra: dict | None = None) -> bo
         "sonar_hash": sonar_hash,
         "ticket_id": ticket_id,
         "status": STATUS_IN_FLIGHT,
+        # Coarse progress phase (ADR-003): a freshly claimed job is "queued"
+        # until the runtime starts emitting intermediate phase writes. Set for
+        # BOTH the Jira and IDE claim paths (both go through _claim_job).
+        "phase": PHASE_QUEUED,
         "created_at": now,
         "updated_at": now,
         "lease_expires_at": lease_expires_at,
@@ -798,3 +822,114 @@ def handler_ide(event, context):  # noqa: ANN001 - Lambda signature
             "actor": actor,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Status polling API (FEAT-003 / ADR-003)
+#
+# A READ-ONLY Lambda serving GET /tasks/{task_id}. The IDE polls it every few
+# seconds until a terminal status. It sits behind the SAME JWT authorizer as the
+# ingress (ADR-001): API Gateway has already verified the token, so we only READ
+# the verified claims and fail closed (401) when no identity is present. This
+# endpoint performs NO claim / enqueue / mutation — it only reads the existing
+# status row the runtime (and _claim_job) write.
+#
+# The logical ``task_id`` path parameter is read against the PHYSICAL partition
+# key attribute ``sonar_hash`` (ADR-004: task_id is the logical alias, the
+# attribute name never changed). Any free-text ``reason`` is routed through
+# redact() so a secret can never leak back to the IDE.
+# ---------------------------------------------------------------------------
+
+
+def _extract_task_id(event: dict) -> str:
+    """Return the ``task_id`` path parameter from an HTTP API event.
+
+    Tolerates the API Gateway HTTP API v2 shape (``event.pathParameters`` and
+    ``event.requestContext.pathParameters``) and a direct-dict test shape
+    (a top-level ``task_id``). Returns an empty string when absent. Never raises.
+    """
+    if not isinstance(event, dict):
+        return ""
+
+    # Direct-dict test shape.
+    direct = event.get("task_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    for container in (event.get("pathParameters"),):
+        if isinstance(container, dict):
+            value = container.get("task_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    request_context = event.get("requestContext")
+    if isinstance(request_context, dict):
+        path_params = request_context.get("pathParameters")
+        if isinstance(path_params, dict):
+            value = path_params.get("task_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ""
+
+
+def status_handler(event, context):  # noqa: ANN001 - Lambda signature
+    """Lambda entry point for GET /tasks/{task_id} (read-only status poll).
+
+    Flow:
+      1. Require a verified JWT identity (401 if absent), reusing the FEAT-002
+         claims helper.
+      2. Read the ``task_id`` path parameter (400 if missing).
+      3. Read the status row from DynamoDB by the logical task_id (physical
+         ``sonar_hash`` attribute). 404 when the row does not exist.
+      4. Return a stable JSON contract: {task_id, status, phase?, pr_url? (when
+         done), reason? (REDACTED, when failed/tests_failed), updated_at?}.
+
+    No mutation of any kind happens here.
+    """
+    # --- Authenticate: read verified JWT claims (fail closed) ---
+    claims = _extract_jwt_claims(event)
+    actor = _actor_from_claims(claims)
+    if not actor:
+        return _response(401, {"error": "missing verified developer identity"})
+
+    task_id = _extract_task_id(event)
+    if not task_id:
+        return _response(400, {"error": "missing task_id path parameter"})
+
+    # --- Read the status row (read-only) ---
+    try:
+        table = _dynamodb.Table(DYNAMODB_TABLE)
+        result = table.get_item(Key={"sonar_hash": task_id})
+    except ClientError as exc:
+        return _response(500, {"error": redact(f"dynamodb error: {exc}")})
+
+    item = (result or {}).get("Item")
+    if not item:
+        return _response(404, {"error": "task not found", "task_id": task_id})
+
+    status = item.get("status", "")
+    body: dict = {"task_id": task_id, "status": status}
+
+    phase = item.get("phase")
+    if phase:
+        body["phase"] = phase
+    updated_at = item.get("updated_at")
+    if updated_at is not None:
+        body["updated_at"] = updated_at
+
+    # Surface the PR link only once the job is done.
+    if status == STATUS_DONE:
+        pr_url = item.get("pr_url")
+        if pr_url:
+            body["pr_url"] = pr_url
+
+    # Surface a redacted reason for non-success terminal states.
+    if status in (STATUS_FAILED, STATUS_TESTS_FAILED):
+        reason = item.get("reason")
+        if reason is not None:
+            # The runtime already redacts, but redact again here as defence in
+            # depth so a secret can never leak back to the IDE.
+            body["reason"] = redact(reason)
+
+    return _response(200, body)

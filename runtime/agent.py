@@ -67,6 +67,24 @@ STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_TESTS_FAILED = "tests_failed"
 
+# Coarse progress phases (ADR-003) the runtime emits as best-effort writes so
+# the IDE status poll can show "queued -> cloning -> fixing -> testing ->
+# opening_pr -> <terminal>". These string values MUST stay in sync with the
+# orchestrator (orchestrator/handler.py: PHASE_* / PHASE_FOR_STATUS); a test
+# asserts equality. The orchestrator sets PHASE_QUEUED on claim; the runtime
+# writes the intermediate phases below without touching the terminal ``status``.
+PHASE_QUEUED = "queued"
+PHASE_CLONING = "cloning"
+PHASE_FIXING = "fixing"
+PHASE_TESTING = "testing"
+PHASE_OPENING_PR = "opening_pr"
+# Terminal phase mapping aligned to the terminal statuses the runtime writes.
+PHASE_FOR_STATUS = {
+    STATUS_DONE: "done",
+    STATUS_FAILED: "failed",
+    STATUS_TESTS_FAILED: "tests_failed",
+}
+
 # Names of the environment variables whose VALUES must never leak into argv,
 # logs, exceptions, or responses. redact() reads them from os.environ at call
 # time (not cached) so tests can monkeypatch the environment without a reload.
@@ -257,6 +275,29 @@ def write_job_status(sonar_hash: str, status: str,
         )
     except Exception as exc:  # noqa: BLE001 - never raise out of a status write
         log.warning("write_job_status failed: %s", redact(str(exc)))
+
+
+def write_phase(sonar_hash: str, phase: str) -> None:
+    """Update ONLY the coarse ``phase`` attribute on the job row (ADR-003).
+
+    This is an ADDITIVE, best-effort progress write: it never changes the
+    terminal ``status`` and never raises (matching the write_job_status
+    contract), so a failed/slow phase write can never mask or replace the real
+    pipeline result. ``updated_at`` is refreshed so the IDE sees the row move.
+    """
+    if not sonar_hash:
+        log.warning("write_phase: missing sonar_hash — skipping phase write.")
+        return
+    try:
+        table = _dynamodb.Table(DYNAMODB_TABLE)
+        table.update_item(
+            Key={"sonar_hash": sonar_hash},
+            UpdateExpression="SET #p = :p, #u = :u",
+            ExpressionAttributeNames={"#p": "phase", "#u": "updated_at"},
+            ExpressionAttributeValues={":p": phase, ":u": int(time.time())},
+        )
+    except Exception as exc:  # noqa: BLE001 - never raise out of a status write
+        log.warning("write_phase failed: %s", redact(str(exc)))
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1128,9 @@ def run_pipeline(payload: dict) -> dict:
 
         # 1. Clone
         log.info("=== STEP 1: Clone ===")
+        # ADR-003 coarse progress: best-effort phase write (never raises, never
+        # changes the terminal status) so the IDE poll shows "cloning".
+        write_phase(sonar_hash, PHASE_CLONING)
         repo_dir = step_clone(repo_clone_url, base_branch, workdir)
 
         # 2. Branch
@@ -1134,6 +1178,8 @@ def run_pipeline(payload: dict) -> dict:
                      "GREEN" if baseline_passed else "RED")
 
         # 3-4. Fix + Test loop
+        # ADR-003: entering the kiro fix loop -> "fixing".
+        write_phase(sonar_hash, PHASE_FIXING)
         last_failure: str | None = None
         tests_passed = False
         test_output = ""
@@ -1174,6 +1220,8 @@ def run_pipeline(payload: dict) -> dict:
                 break
 
             log.info("=== STEP 4: Run tests (attempt %d/%d) ===", attempt, MAX_FIX_ATTEMPTS)
+            # ADR-003: running the test suite -> "testing".
+            write_phase(sonar_hash, PHASE_TESTING)
             tests_passed, test_output = step_run_tests(repo_dir)
 
             if tests_passed:
@@ -1244,6 +1292,10 @@ def run_pipeline(payload: dict) -> dict:
         # 7. Open PR
         log.info("=== STEP 7: Open PR (no_tests=%s tests_passed=%s) ===",
                  no_tests, tests_passed)
+        # ADR-003: about to open the PR -> "opening_pr". Best-effort; the
+        # terminal status/phase is written by the entrypoint once the pipeline
+        # result is known.
+        write_phase(sonar_hash, PHASE_OPENING_PR)
         if no_tests:
             pr_url = step_open_pr(
                 repo_dir, base_branch, fix_branch, summary, ticket_id,
@@ -1342,8 +1394,12 @@ async def entrypoint(payload: dict):
         # str(exc) can echo command output/stderr; redact before it leaves here.
         reason = redact(str(exc))
         result = {"status": "failed", "reason": reason}
-        # #6: an unexpected exception is a hard failure.
-        write_job_status(sonar_hash, STATUS_FAILED, {"reason": reason})
+        # #6: an unexpected exception is a hard failure. ADR-003: also record a
+        # terminal phase alongside the status (additive; status is unchanged).
+        write_job_status(
+            sonar_hash, STATUS_FAILED,
+            {"reason": reason, "phase": PHASE_FOR_STATUS[STATUS_FAILED]},
+        )
     else:
         # #6/#8: translate the pipeline result into a terminal DynamoDB status.
         #   success                         -> done + pr_url
@@ -1355,12 +1411,14 @@ async def entrypoint(payload: dict):
         if result.get("status") == "success":
             write_job_status(
                 sonar_hash, STATUS_DONE,
-                {"pr_url": result.get("pr_url", "")},
+                {"pr_url": result.get("pr_url", ""),
+                 "phase": PHASE_FOR_STATUS[STATUS_DONE]},
             )
         else:
             write_job_status(
                 sonar_hash, STATUS_TESTS_FAILED,
-                {"reason": redact(str(result.get("reason", "")))},
+                {"reason": redact(str(result.get("reason", ""))),
+                 "phase": PHASE_FOR_STATUS[STATUS_TESTS_FAILED]},
             )
 
     yield {"event": {"text": redact(json.dumps(result, indent=2))}}
