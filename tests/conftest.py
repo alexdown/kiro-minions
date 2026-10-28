@@ -86,6 +86,29 @@ def _reset_sdk_stubs():
     install_sdk_stubs()
 
 
+@pytest.fixture(autouse=True)
+def _gates_off_by_default(monkeypatch):
+    """Default both verification gates OFF for the suite.
+
+    The gates default ON in production (opt-out). The legacy pipeline
+    characterization tests (test_agent_phase/test_agent_argv/
+    test_secret_redaction) script the exact subprocess sequence of the
+    pre-gate pipeline, so they must run with gates OFF. Gate-specific tests
+    (test_review_gates/test_spec_gates/test_oneshot_gates) set these env vars
+    themselves and reload review_gates, overriding this default.
+    """
+    monkeypatch.setenv("SPEC_REVIEW_ENABLED", "0")
+    monkeypatch.setenv("SPEC_VERIFY_SPEC_ENABLED", "0")
+    try:
+        import review_gates  # noqa: E402 - sys.path set above
+        importlib.reload(review_gates)
+    except Exception:
+        # review_gates imports agent (SDK stubs) — if unavailable in a given
+        # collection context, the gate tests that need it manage their own
+        # reload; nothing else depends on it.
+        pass
+
+
 # --- step-1 characterization fixtures (adapted to the SDK stubs) -----------
 
 

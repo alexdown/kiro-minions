@@ -673,6 +673,18 @@ def _build_ide_payload(mapped: dict) -> dict:
     tasks_md = mapped.get("tasks_md")
     if tasks_md is not None:
         payload["tasks_md"] = tasks_md
+    # Optional Gate B (verify-vs-spec) acceptance inputs (ADR-008): carry each
+    # only when present so a payload without them stays byte-for-byte
+    # compatible (mirrors the tasks_md_path/tasks_md conditional add).
+    for spec_field in (
+        "requirements_md_path",
+        "design_md_path",
+        "requirements_md",
+        "design_md",
+    ):
+        value = mapped.get(spec_field)
+        if value is not None:
+            payload[spec_field] = value
     return payload
 
 
