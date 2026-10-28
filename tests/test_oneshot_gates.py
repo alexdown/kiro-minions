@@ -13,9 +13,9 @@ On the one-shot path:
   * Gate B (verify-vs-spec) is a documented SKIP-WITH-NOTICE (the one-shot path
     has no Kiro spec, so ``acceptance_text=None`` -> Q3 absent-spec rule).
 
-Flags default OFF; with the flags off ``run_pipeline`` is byte-for-byte
-unchanged (no ``git diff base..fix``, no extra kiro-cli review call, non-draft
-PR, no ``## Verification`` section). The existing one-shot tests
+Flags default ON (opt-out); with both flags opted OFF ``run_pipeline`` is
+byte-for-byte unchanged (no ``git diff base..fix``, no extra kiro-cli review
+call, non-draft PR, no ``## Verification`` section). The existing one-shot tests
 (tests/test_agent.py etc.) cover that OFF behaviour unmodified; a dedicated
 flags-OFF regression lives here too.
 
@@ -119,10 +119,12 @@ def restore_runner():
 
 @pytest.fixture
 def gate_a_on(monkeypatch):
-    """Turn the Gate A flag ON and reload review_gates (agent does NOT own the
-    flags, so it is NOT reloaded). Teardown restores the env and reloads
-    review_gates back to its flags-OFF module-level default."""
+    """Turn the Gate A flag ON and Gate B OFF, then reload review_gates (agent
+    does NOT own the flags, so it is NOT reloaded). Gates default ON now, so
+    Gate B is explicitly disabled to isolate Gate A. Teardown restores the env
+    and reloads review_gates back to its module-level default."""
     monkeypatch.setenv("SPEC_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("SPEC_VERIFY_SPEC_ENABLED", "0")
     importlib.reload(review_gates)
     try:
         assert review_gates.SPEC_REVIEW_ENABLED is True
@@ -130,6 +132,7 @@ def gate_a_on(monkeypatch):
         yield review_gates
     finally:
         monkeypatch.delenv("SPEC_REVIEW_ENABLED", raising=False)
+        monkeypatch.delenv("SPEC_VERIFY_SPEC_ENABLED", raising=False)
         importlib.reload(review_gates)
 
 
@@ -334,8 +337,12 @@ def test_no_secret_leak_in_gate_phase(gate_a_on, fixed_workdir, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_flags_off_one_shot_unchanged_no_review_call(fixed_workdir):
-    # Flags are OFF by default (review_gates imported at its module default).
+def test_flags_off_one_shot_unchanged_no_review_call(fixed_workdir, monkeypatch):
+    # Gates default ON now, so explicitly opt BOTH out to exercise the
+    # flags-off regression path (one-shot PR path byte-for-byte unchanged).
+    monkeypatch.setenv("SPEC_REVIEW_ENABLED", "0")
+    monkeypatch.setenv("SPEC_VERIFY_SPEC_ENABLED", "0")
+    importlib.reload(review_gates)
     assert review_gates.SPEC_REVIEW_ENABLED is False
     assert review_gates.SPEC_VERIFY_SPEC_ENABLED is False
 

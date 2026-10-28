@@ -11,6 +11,7 @@ Coverage:
   * parse_verdict defensive paths (clean, garbage, bare object, prose-wrapped);
   * severity routing (clean -> not draft, high -> draft, low -> advisory,
     inconclusive -> draft);
+  * default-ON (opt-out) flag semantics: unset => ON, '0'/'false'/'no' => OFF;
   * run_gate_a / run_gate_b against FakeRunner incl. timeout -> inconclusive,
     flag off -> skipped (no kiro call), Gate B empty acceptance -> skip notice;
   * secret hygiene: sentinel masked, brief via STDIN (CallRecord.input) not
@@ -56,6 +57,38 @@ def _reload_with_flags(monkeypatch, *, gate_a=False, gate_b=False,
     if timeout is not None:
         monkeypatch.setenv("SPEC_REVIEW_TIMEOUT_S", str(timeout))
     return importlib.reload(review_gates)
+
+
+# ---------------------------------------------------------------------------
+# Default-ON (opt-out) flag semantics. Both gates run unless explicitly
+# disabled; '0'/'false'/'no' (any case, trimmed) opt out; unset/empty => ON.
+# ---------------------------------------------------------------------------
+
+
+def test_flags_default_on_when_unset(monkeypatch):
+    monkeypatch.delenv("SPEC_REVIEW_ENABLED", raising=False)
+    monkeypatch.delenv("SPEC_VERIFY_SPEC_ENABLED", raising=False)
+    rg = importlib.reload(review_gates)
+    assert rg.SPEC_REVIEW_ENABLED is True
+    assert rg.SPEC_VERIFY_SPEC_ENABLED is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "FALSE", "No", " 0 "])
+def test_flags_opt_out_values_disable(monkeypatch, value):
+    monkeypatch.setenv("SPEC_REVIEW_ENABLED", value)
+    monkeypatch.setenv("SPEC_VERIFY_SPEC_ENABLED", value)
+    rg = importlib.reload(review_gates)
+    assert rg.SPEC_REVIEW_ENABLED is False
+    assert rg.SPEC_VERIFY_SPEC_ENABLED is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "", "anything"])
+def test_flags_on_for_unset_or_non_optout_values(monkeypatch, value):
+    monkeypatch.setenv("SPEC_REVIEW_ENABLED", value)
+    monkeypatch.setenv("SPEC_VERIFY_SPEC_ENABLED", value)
+    rg = importlib.reload(review_gates)
+    assert rg.SPEC_REVIEW_ENABLED is True
+    assert rg.SPEC_VERIFY_SPEC_ENABLED is True
 
 
 # ---------------------------------------------------------------------------

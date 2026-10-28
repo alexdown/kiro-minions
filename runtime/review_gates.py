@@ -60,20 +60,19 @@ log = agent.log
 # ---------------------------------------------------------------------------
 # Gate flags + per-gate timeout (read at MODULE LEVEL like
 # spec_agent.SPEC_MAX_TASK_ATTEMPTS so a test importlib.reload picks up a
-# monkeypatched env). Both gate flags default OFF: with the flags off the gate
-# runners are no-ops (skipped) and both worker paths are byte-for-byte
-# unchanged. There is NO SPEC_MAX_REVIEW_RETRIES (ADR-008 Q4: no
-# auto-remediation loop).
+# monkeypatched env). Both gate flags default ON (opt-out): when unset the gate
+# runs. Set the flag to '0'/'false'/'no' to disable a gate. There is NO
+# SPEC_MAX_REVIEW_RETRIES (ADR-008 Q4: no auto-remediation loop).
 # ---------------------------------------------------------------------------
 
 
 def _env_flag(name: str) -> bool:
-    """Parse a boolean feature flag from the environment (default OFF).
+    """Parse a boolean feature flag from the environment (default ON).
 
-    ``'1'`` / ``'true'`` / ``'yes'`` (case-insensitive, surrounding whitespace
-    ignored) mean ON; everything else (including unset) means OFF.
+    ``'0'`` / ``'false'`` / ``'no'`` (case-insensitive, surrounding whitespace
+    ignored) mean OFF; everything else (including unset) means ON.
     """
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+    return os.environ.get(name, "").strip().lower() not in {"0", "false", "no"}
 
 
 # Gate A (adversarial review) enable flag.

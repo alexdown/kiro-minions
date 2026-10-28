@@ -5,8 +5,9 @@ These exercise the POST-LOOP gate phase wired into
 that runs ONCE, after ALL tasks are built/tested/committed and after the push,
 but BEFORE the PR is opened, on the CUMULATIVE ``base..fix`` branch diff.
 
-Flags default OFF; with the flags off the phase is a no-op and the existing
-spec-executor behaviour (tests/test_spec_agent.py) is byte-for-byte unchanged.
+Flags default ON (opt-out); with both flags opted OFF the phase is a no-op and
+the existing spec-executor behaviour (tests/test_spec_agent.py) is byte-for-byte
+unchanged.
 These tests flip the flags ON by monkeypatching the env and
 ``importlib.reload(review_gates)`` so the module-level flags pick up the
 override, then reload ``spec_agent`` so it re-imports the reloaded gate module.
@@ -89,7 +90,7 @@ def gates_on(monkeypatch):
 
     Yields the reloaded ``spec_agent`` module (whose ``review_gates`` reference
     now points at the reloaded, flags-ON gate module). Teardown restores the
-    env and reloads both modules back to their flags-OFF module-level state so
+    env and reloads both modules back to their module-level default state so
     other tests are unaffected.
     """
     monkeypatch.setenv("SPEC_REVIEW_ENABLED", "1")
@@ -644,11 +645,12 @@ def test_no_secret_in_gate_argv_stdin_or_pr_body(gates_on, monkeypatch):
 
 
 def test_flags_off_no_review_call_non_draft(monkeypatch):
-    """With flags OFF (the default) the gate phase is a no-op: no review kiro
-    pass beyond the 3 coding passes, and the PR stays non-draft."""
-    # Ensure a clean, flags-OFF module state regardless of prior test order.
-    monkeypatch.delenv("SPEC_REVIEW_ENABLED", raising=False)
-    monkeypatch.delenv("SPEC_VERIFY_SPEC_ENABLED", raising=False)
+    """With both flags opted OFF the gate phase is a no-op: no review kiro
+    pass beyond the 3 coding passes, and the PR stays non-draft. Gates default
+    ON now, so both flags are explicitly disabled here."""
+    # Explicitly opt both gates OUT regardless of prior test order.
+    monkeypatch.setenv("SPEC_REVIEW_ENABLED", "0")
+    monkeypatch.setenv("SPEC_VERIFY_SPEC_ENABLED", "0")
     importlib.reload(review_gates)
     mod = importlib.reload(spec_agent)
     try:
