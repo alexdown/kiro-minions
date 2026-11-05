@@ -22,7 +22,7 @@ Jira ticket (label=sonarqube + sonar-hash:<key>)
 
 The coding agent is a **deterministic Python script** running in an **AgentCore Runtime** custom container. There is no outer model loop — the only AI reasoning happens inside `kiro-cli` itself. The workflow steps (clone, branch, test, commit, push, PR) are plain sequential code.
 
-**Why B1 over a managed harness?**
+**Why a deterministic pipeline?**
 
 - **Single agent loop** — kiro-cli is the only model invocation. No tokens wasted on deciding to run `git clone`.
 - **Predictable** — the workflow executes the same way every time. No model deviation.
@@ -226,7 +226,6 @@ identity.
 orchestrator/   Lambdas: Jira webhook producer (handler.handler) + IDE ingress (handler.handler_ide)
                 + status poll (handler.status_handler) + SQS consumer (handler.sqs_consumer)
 runtime/        AgentCore Runtime container (Dockerfile + deterministic pipeline script)
-agent/          [LEGACY] Original managed-harness definition (kept for reference)
 specs/          Design docs
 deploy/         SAM template (API Gateway + Lambdas + SQS + DLQ + DynamoDB)
 tests/          Unit tests

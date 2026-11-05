@@ -101,7 +101,7 @@ response = client.invoke(
 
 Key points:
 
-- The consumer calls **`invoke`** on the `bedrock-agentcore` client (not `invoke_harness`).
+- The consumer calls **`invoke`** on the `bedrock-agentcore` client.
 - `runtimeSessionId` is derived from `sonar_hash` + UUID for traceability, **≥ 33 characters**.
 - The payload is the TicketPayload JSON — no prompt rendering, no natural-language template.
 - The Runtime's `agent.py` receives the payload directly in its `@app.entrypoint` handler.

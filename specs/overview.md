@@ -177,10 +177,9 @@ AWS SAM template providing:
 
 The orchestrator needs **no external credentials** beyond AWS IAM.
 
-## Design decision: B1 (deterministic) over managed harness
+## Design decision: B1 (deterministic pipeline)
 
-See [runtime.md](runtime.md) for the full comparison. Summary:
+See [runtime.md](runtime.md) for the full rationale and tradeoffs. Summary:
 
-- **Previous (managed harness):** two nested model loops — the harness model reasons about git/test/PR workflow, then calls kiro-cli which does its own reasoning. Double token cost, double latency, model can deviate from the script.
-- **Current (B1 Runtime):** one model call (kiro-cli). Everything else is sequential Python. Predictable, testable, cheaper, faster.
+- **B1 Runtime:** one model call (kiro-cli). Everything else is sequential Python. Predictable, testable, cheaper, and faster, because the mechanical git/test/PR workflow does not need a model to run it.
 - **Future (B2):** if needed, add model reasoning only for error recovery on novel failures. Keep the happy path deterministic.
