@@ -1,40 +1,57 @@
 # kiro-minions
 
-Autonomous SonarQube remediation: a labelled Jira ticket goes in, a GitHub PR comes out.
+A remote autonomous coding worker: hand it a coding task, it runs on AWS AgentCore, and it delivers a GitHub PR.
+
+You dispatch a task through one of two ingresses, the system runs the work on an isolated AgentCore Runtime, and the result comes back as a pull request.
 
 ```
-Jira ticket (label=sonarqube + sonar-hash:<key>)
-  → webhook → API Gateway → Orchestrator (Lambda, Python)
-      → parse webhook body directly (no Jira API call)
-      → extract structured header (clone URL, base branch, fix branch, file) + sonar_hash label
-      → dedup / claim on sonar_hash; enqueue TicketPayload JSON on SQS → return 202
-  → SQS work queue (+ DLQ) → Consumer (Lambda, Python)
-      → invoke AgentCore Runtime with the TicketPayload JSON
-  → Runtime (custom container — deterministic pipeline, no outer model loop)
-      → git clone → checkout base_branch → create fix_branch
-      → kiro-cli headless (brief = ticket description) → run tests
-      → retry loop (up to 3 attempts) → commit → push → open PR
-      → write terminal job status (done/failed/tests_failed) to DynamoDB
-  → GitHub PR (against base_branch)
+task in (one of two ingresses)
+  → API Gateway → Orchestrator (Lambda, Python)
+      → authenticate → validate + repo allowlist
+      → claim an idempotency key (DynamoDB lease)
+      → enqueue TaskPayload JSON on SQS JobsQueue (+ DLQ) → return 202
+  → SQS JobsQueue → Consumer (Lambda, Python)
+      → invoke AgentCore Runtime with the TaskPayload JSON
+  → Runtime (custom container, deterministic pipeline, no outer model loop)
+      → git clone → checkout base_branch → create fix branch
+      → run the pipeline selected by task_type (one_shot or spec)
+      → commit → push → open PR
+      → write terminal job status (done + pr_url / failed / tests_failed) to DynamoDB
+  → GitHub PR out (against base_branch)
 ```
+
+The two ingresses, the two task shapes, and the one shared spine are described below; they are peers in one system.
 
 ## Architecture: B1 (deterministic pipeline)
 
-The coding agent is a **deterministic Python script** running in an **AgentCore Runtime** custom container. There is no outer model loop — the only AI reasoning happens inside `kiro-cli` itself. The workflow steps (clone, branch, test, commit, push, PR) are plain sequential code.
+The core principle is a **deterministic pipeline**. The worker is a **deterministic Python script** running in an **AgentCore Runtime** custom container. There is no outer model loop: the only AI reasoning happens inside `kiro-cli` (and inside the optional verification gates). The workflow steps (clone, branch, test, commit, push, PR) are plain sequential code.
 
-**Why B1 over a managed harness?**
+**Why a deterministic pipeline?**
 
 - **Single agent loop** — kiro-cli is the only model invocation. No tokens wasted on deciding to run `git clone`.
 - **Predictable** — the workflow executes the same way every time. No model deviation.
 - **Testable** — the pipeline is Python code you can unit-test and mock.
 - **Fast** — deterministic steps run at shell speed; only the fix step waits for model inference.
 
-## Flow
+## The two ingresses
 
-The pipeline is **asynchronous**: the webhook Lambda validates, claims the hash,
-and enqueues the payload, then returns `202` immediately. A separate SQS-triggered
-consumer Lambda invokes the long-running AgentCore Runtime, and the Runtime writes
-its own terminal job status back to DynamoDB.
+A task reaches the system through one of two ingresses. They are equal citizens: both authenticate the caller, map the request to the shared `TaskPayload`, and feed the same downstream spine.
+
+- **Jira webhook.** A SonarQube finding is filed as a labelled Jira ticket (`label=sonarqube` + a `sonar-hash:<key>` label). The ticket description is the task contract. The webhook producer authenticates the request with an HMAC signature or a shared secret, parses the webhook body directly (no Jira API call), and extracts the structured header (clone URL, base branch, fix branch, file) plus the `sonar_hash` label. See [specs/ide-ingress.md](specs/ide-ingress.md) for the IDE side and [specs/payload.md](specs/payload.md) for the shared contract.
+- **Kiro IDE API.** A developer dispatches a task straight from the Kiro IDE and has it run on a remote worker instead of their laptop. `POST /tasks` (OIDC/JWT auth, per-actor identity) dispatches a task; `GET /tasks/{task_id}` (owner-scoped) polls its status. See the [Kiro IDE task ingress](#kiro-ide-task-ingress) section below.
+
+## The shared spine
+
+Both ingresses and both task shapes run the same asynchronous spine:
+
+1. **Authenticate** the caller (webhook HMAC/shared-secret for Jira, OIDC/JWT for the IDE).
+2. **Validate** the request and check the repo allowlist.
+3. **Claim** an idempotency key atomically with a DynamoDB lease.
+4. **Enqueue** the `TaskPayload` on the SQS `JobsQueue` (with a DLQ, `maxReceiveCount=3`) and return `202` immediately.
+5. An SQS-triggered **consumer** Lambda invokes the long-running AgentCore Runtime.
+6. The **Runtime** runs the deterministic pipeline selected by `task_type` and writes its **own terminal job status** (`done` + `pr_url` / `failed` / `tests_failed`) back to DynamoDB.
+
+The diagram below shows the spine for a Jira-sourced task; an IDE-sourced task follows the identical path from the claim onward.
 
 ```
             webhook (issue created/updated, label=sonarqube + sonar-hash:<key>)
@@ -87,38 +104,39 @@ its own terminal job status back to DynamoDB.
                                                         GitHub PR     DynamoDB (job status)
 ```
 
-## Kiro IDE task ingress (second ingress)
+<a id="kiro-ide-task-ingress"></a>
+## Kiro IDE task ingress
 
-Alongside the Jira webhook, kiro-minions exposes a **second ingress** so a
-developer can dispatch a task straight from the Kiro IDE and have it run on a
-remote worker instead of their laptop (see
-[specs/ide-ingress.md](specs/ide-ingress.md)). It reuses the **same** downstream
-pipeline — the same `JobsQueue`, consumer, AgentCore Runtime, and jobs table —
-so the only new parts are the ingress mapping, an OIDC/JWT authorizer, and a
-read-only status poll. Result delivery is unchanged: the fix still arrives as a
-**GitHub PR** via the existing runtime push+PR mechanism (ADR-006).
+The Kiro IDE ingress lets a developer dispatch a task straight from the Kiro IDE
+and have it run on a remote worker instead of their laptop (see
+[specs/ide-ingress.md](specs/ide-ingress.md)). It maps an IDE request to the
+shared `TaskPayload` and feeds the same downstream spine: the same `JobsQueue`,
+consumer, AgentCore Runtime, and jobs table. An OIDC/JWT authorizer identifies
+the developer, and a read-only status poll reports progress. The result arrives
+as a **GitHub PR** via the runtime push+PR mechanism (ADR-006).
 
-> **Naming:** the Jira path has always spoken of a "ticket"; the IDE path speaks
-> of a **task**. These are the same thing on the wire — the shared payload keeps
-> every runtime-read field name unchanged (`ticket_id`, `sonar_hash`, …) and
-> adds `source` / `actor`. "Ticket → Task" is a docs/tests-level naming shift,
-> **not** a wire change. A Jira payload carries `source="jira"`; an IDE payload
-> carries `source="kiro-ide"` and the developer's `actor` identity.
+A Jira payload carries `source="jira"`; an IDE payload carries
+`source="kiro-ide"` and the developer's `actor` identity. Every runtime-read
+field name is shared across both ingresses, so the claim/lease logic, the
+consumer, and the runtime are identical for either source.
 
-An **IDE task comes in two shapes** (selected by a `task_type` discriminator,
-ADR-002), both with acceptance fixed to **tests pass** in v1:
+## The two task shapes
 
-- **`one_shot`** (the original scoped fix): a natural-language `instruction`
-  (→ the kiro-cli brief) and an optional `target` file/area hint
-  (→ `file_to_fix`). It reuses `runtime/agent.py` unchanged.
-- **`spec`** (the headline IDE shape): a **whole `tasks.md`** produced by a
-  local Kiro spec-driven workflow (`requirements.md` → `design.md` →
-  `tasks.md`, often tens of tasks). The developer offloads the ENTIRE task list
-  to the remote **spec-executor** worker (`runtime/spec_agent.py`), which reads
-  the list and iterates task-by-task: a fresh per-task brief, one commit per
-  completed task on one branch, one PR per spec, and stop-at-first-blocker. The
-  task list is referenced by a repo-relative `tasks_md_path` (read after clone)
-  or passed inline as `tasks_md`. See
+A task comes in one of two shapes, selected by a `task_type` discriminator
+(ADR-002), with acceptance fixed to **tests pass**:
+
+- **`one_shot`** (one brief, one fix, one PR): a scoped fix driven by a
+  natural-language `instruction` (→ the kiro-cli brief) and an optional `target`
+  file/area hint (→ `file_to_fix`). The Jira path and IDE `one_shot` requests
+  both use `runtime/agent.py`.
+- **`spec`** (a whole `tasks.md` run task-by-task): a **whole `tasks.md`**
+  produced by a local Kiro spec-driven workflow (`requirements.md` →
+  `design.md` → `tasks.md`, often tens of tasks). The developer offloads the
+  ENTIRE task list to the remote **spec-executor** worker
+  (`runtime/spec_agent.py`), which reads the list and iterates task-by-task: a
+  fresh per-task brief, one commit per completed task on one branch, one PR per
+  spec, and stop-at-first-blocker. The task list is referenced by a repo-relative
+  `tasks_md_path` (read after clone) or passed inline as `tasks_md`. See
   [specs/spec-executor.md](specs/spec-executor.md).
 
 ### Endpoints
@@ -175,7 +193,7 @@ A **spec** job offloads a whole `tasks.md` instead (see
   shared table, nor target another tenant's row via the status API.
 - The logical `task_id` is carried in the **physical `sonar_hash` partition-key
   attribute** (ADR-004), so the claim/lease logic, the consumer, and the runtime
-  are reused unchanged.
+  are identical across both ingresses.
 - Responses: `202 {status: "accepted", task_id, actor}` on dispatch;
   `200 {status: "skipped"}` when the task is already `in_flight`/`done`;
   `400` invalid request; `401` no verified identity; `403` repo not in the
@@ -226,7 +244,6 @@ identity.
 orchestrator/   Lambdas: Jira webhook producer (handler.handler) + IDE ingress (handler.handler_ide)
                 + status poll (handler.status_handler) + SQS consumer (handler.sqs_consumer)
 runtime/        AgentCore Runtime container (Dockerfile + deterministic pipeline script)
-agent/          [LEGACY] Original managed-harness definition (kept for reference)
 specs/          Design docs
 deploy/         SAM template (API Gateway + Lambdas + SQS + DLQ + DynamoDB)
 tests/          Unit tests
@@ -372,7 +389,7 @@ OIDC/JWT token.
 | `KIRO_API_KEY` | Runtime container env | kiro-cli headless |
 | `DYNAMODB_TABLE` | Runtime + both Lambdas env | shared jobs table (claim + terminal status) |
 | `AGENTCORE_RUNTIME_ARN` | Both Lambdas env | which Runtime to invoke |
-| `SQS_QUEUE_URL` | Orchestrator (producer) Lambda env | work queue to enqueue TicketPayloads onto |
+| `SQS_QUEUE_URL` | Orchestrator (producer) Lambda env | work queue to enqueue TaskPayloads onto |
 | `LEASE_SECONDS` | Orchestrator (producer) Lambda env | claim lease validity (default `3600`); after it expires a stale `in_flight` row is reclaimable |
 | `WEBHOOK_SECRET` | Orchestrator (producer) Lambda env | webhook shared secret / HMAC key (resolved from SSM at deploy; **never** hardcoded). When set, `verify_webhook` **fails closed** (401 for a missing credential header, 403 for an invalid signature/secret); when empty, verification is skipped (fail-open) for local/direct invokes and unconfigured deployments. All compares use `hmac.compare_digest` (constant-time) |
 | `REPO_ALLOWLIST` | Orchestrator (producer) + Ingress Lambda env | comma/whitespace separated owner/repo glob patterns; a ticket/task whose repo is not allowed is rejected 403 before any claim/enqueue. Empty = allow all. Re-checked in the runtime |
@@ -415,5 +432,6 @@ reclaim gate, independent of when the TTL sweeper runs.
 - [specs/payload.md](specs/payload.md) — payload schema + ticket parsing
 - [specs/runtime.md](specs/runtime.md) — Runtime container design and deployment
 - [specs/ide-ingress.md](specs/ide-ingress.md) — Kiro IDE task ingress (remote worker hand-off)
-- [specs/spec-executor.md](specs/spec-executor.md) : spec-executor worker (whole `tasks.md` offload, ADR-002 Option C)
+- [specs/spec-executor.md](specs/spec-executor.md) — spec-executor worker (runs a whole `tasks.md` task-by-task)
+- [specs/verification-gates.md](specs/verification-gates.md) — optional verification gates (adversarial review + verify-vs-spec)
 - [specs/adr/README.md](specs/adr/README.md) — Architecture Decision Registry

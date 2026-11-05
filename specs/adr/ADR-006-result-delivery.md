@@ -1,6 +1,6 @@
 # ADR-006: How the result reaches the developer
 
-**Status:** PROPOSED (needs your decision)
+**Status:** ACCEPTED (Option A — GitHub PR)
 **Context doc:** [../ide-ingress.md](../ide-ingress.md) §7
 
 ## Context
@@ -43,12 +43,12 @@ Worker produces a diff/patch the IDE downloads and applies locally.
 
 ## Decision
 
-_To be recorded by the maintainer._ Recommendation: **Option A (PR)** for v1 — it
-reuses what exists and matches an enforced-workflow culture. Offer **Option B
-(branch)** as a per-task toggle later if devs want a lighter loop. Treat **Option
-C (patch)** as out of scope for v1.
+**Option A (PR)** is accepted and implemented: the worker pushes a branch and
+opens a PR, matching an enforced-workflow culture and needing no new mechanism.
+Option B (branch only) could be offered as a per-task toggle later for a lighter
+loop; Option C (patch artifact) is out of scope.
 
-**Questions that decide this:**
+**Questions that informed this:**
 1. Does the enforced dev workflow already centre on PRs (then A is the obvious
    fit), or do devs expect changes applied straight into their working tree?
 2. Is it acceptable that the worker only acts on *pushed* state (dev must push

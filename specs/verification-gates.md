@@ -28,10 +28,10 @@ deterministic · no model)**, and then opens the PR. It does **not** do:
 
 "Tests pass" is a weak proxy for "correct and matches intent." A task can go
 green while implementing the wrong thing, leaving a security hole, or satisfying
-only the tests the model itself wrote. This spec proposes adding the two missing
-gates as a **post-loop review phase in the worker** — run once, after the whole
-task group is built, tested, and committed, and before the PR is opened (§3) —
-while staying faithful to the project's B1 principle.
+only the tests the model itself wrote. kiro-minions adds the two missing gates as
+a **post-loop review phase in the worker** — run once, after the whole task group
+is built, tested, and committed, and before the PR is opened (§3) — while staying
+faithful to the project's B1 principle.
 
 ---
 
@@ -147,13 +147,13 @@ strength and cost. See ADR-008 Q1.
 
 ---
 
-## 5. Spec inputs the worker needs (new)
+## 5. Spec inputs the worker needs
 
 Gate B checks against the **acceptance criteria**, which live in
-`requirements.md` / `design.md`, not `tasks.md`. Today the payload carries only
-`tasks_md` / `tasks_md_path` ([ide-ingress.md](ide-ingress.md) §5). To do Gate B
-we must give the worker the spec. Proposed, consistent with the existing
-`tasks_md_path` approach:
+`requirements.md` / `design.md`, not `tasks.md`. The base payload carries
+`tasks_md` / `tasks_md_path` ([ide-ingress.md](ide-ingress.md) §5). To run Gate
+B, the worker is given the spec, consistent with the existing `tasks_md_path`
+approach:
 
 - Add optional `requirements_md_path` / `design_md_path` (repo-relative, read
   after clone, traversal-validated and clone-root-contained exactly like
@@ -236,11 +236,13 @@ Gate A needs no new inputs (it works from the cumulative branch diff + the
 
 ---
 
-## 8. Decisions I need from you
+## 8. Decisions (recorded in ADR-008 and implemented)
 
 Both gates run **post-loop, once per spec** (§3, maintainer-directed), so there
-is no per-task-vs-per-spec granularity question and no in-loop review retry.
-Recorded in [adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md):
+is no per-task-vs-per-spec granularity question and no in-loop review retry. The
+decisions below are recorded in
+[adr/ADR-008-verification-gates.md](adr/ADR-008-verification-gates.md) and
+implemented; this section is retained as the question-by-question rationale:
 
 - **Q1 — Review engine:** in-container `kiro-cli` (Option 1, recommended),
   sub-agent reviewer (Option 2), or a different/stronger review model (Option 3)?

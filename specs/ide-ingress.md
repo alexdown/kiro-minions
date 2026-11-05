@@ -1,74 +1,71 @@
 # Spec: Kiro IDE task ingress (remote worker hand-off)
 
-**Status:** ACCEPTED v1 — implemented. ADR-001..007 accepted with the
-recommended options; the ingress (`POST /tasks`), status poll
-(`GET /tasks/{task_id}`), per-actor quota, and audit log are live.
-**Author:** kiro-minions agent (first pass)
+**Status:** IMPLEMENTED. The ingress (`POST /tasks`), status poll
+(`GET /tasks/{task_id}`), per-actor quota, and audit log are live, built on
+ADR-001..007.
 **Related:** [overview.md](overview.md), [payload.md](payload.md), [runtime.md](runtime.md), [adr/README.md](adr/README.md)
 
 ---
 
-## 1. Problem
+## 1. What this ingress is for
 
 A customer runs a Kiro IDE (VSCode) extension that **enforces a dev workflow and
 runs all agents locally**. Local execution makes the developer's laptop the
 compute bottleneck: parallelism is capped at one machine, long tasks block the
 editor, and heavy work drains battery / competes with the dev's own tools.
 
-They want to **hand tasks off to a worker agent on AgentCore** so the laptop is
-no longer the bottleneck and many tasks can run in parallel in the cloud.
+The Kiro IDE ingress lets a developer **hand tasks off to a worker agent on
+AgentCore** so the laptop is no longer the bottleneck and many tasks can run in
+parallel in the cloud. It is one of the two ingresses into kiro-minions (the
+other is the Jira/SonarQube webhook). The IDE extension calls an authenticated
+API to dispatch a task, and a **results channel** lets the IDE show progress and
+the outcome.
 
-kiro-minions already runs exactly this kind of remote worker — a deterministic
-pipeline in an AgentCore Runtime — but today its **only ingress is a Jira
-webhook** for SonarQube findings. This spec proposes a **second ingress**: an
-authenticated API that the IDE extension calls to dispatch a task, plus a
-**results channel** so the IDE can show progress and the outcome.
+### What it provides
 
-### Goals
+- The IDE dispatches a task to a remote AgentCore worker and gets a result (a PR
+  and a status) back.
+- Parallelism scales with AWS concurrency, not laptop cores.
+- The deterministic-pipeline principle (B1) holds: there is no outer model loop
+  in the orchestrator layer.
 
-- Let the IDE dispatch a task to a remote AgentCore worker and get a result
-  (a PR, a branch, or a status) back.
-- **Reuse the existing downstream unchanged** where possible: SQS work queue,
-  DLQ, idempotency/lease, status write-back, and the security controls (repo
-  allowlist, secret redaction, no-token-in-argv, `shell=False`).
-- Scale parallelism with AWS concurrency, not laptop cores.
-- Keep the deterministic-pipeline principle (B1): no new outer model loop in the
-  orchestrator layer.
+### Boundaries
 
-### Non-goals (for v1 of this feature)
-
-- Replacing the Jira ingress (both coexist).
-- Building the VSCode extension itself (the customer owns that; we define the
-  contract it calls).
-- Streaming the full agent transcript to the IDE (status milestones only in v1).
-- An open-ended, model-in-a-loop worker. ADR-002 landed on Option C: a whole
-  `tasks.md` is run by a deterministic spec-executor whose outer loop is plain
-  code, with model reasoning confined to each per-task pass (see §4 and ADR-002).
-  There is no open-ended outer model loop.
+- The VSCode extension itself is the customer's (this spec defines the contract
+  it calls).
+- The results channel reports status milestones, not the full agent transcript.
+- The worker is not an open-ended model-in-a-loop. A `spec` task is run by the
+  deterministic spec-executor whose outer loop is plain code, with model
+  reasoning confined to each per-task pass (see §4 and ADR-002).
 
 ---
 
-## 2. What we can reuse as-is
+## 2. How the ingress maps onto the shared spine
 
-The pipeline today is Jira-shaped only at its two ends:
+The IDE ingress maps an IDE request to the shared `TaskPayload`; everything
+downstream is the same shared spine: the SQS `JobsQueue`, the DLQ, the consumer
+Lambda, the AgentCore Runtime, the status write-back, and the security controls
+(repo allowlist, secret redaction, no-token-in-argv, `shell=False`). Only the
+ingress surface is IDE-specific:
 
-| Layer | Jira-specific? | Reuse for IDE ingress |
-|-------|----------------|------------------------|
-| Webhook parser (`parser.py`: label gate, Part-1 header, `sonar-hash`) | **Yes** | Replaced by an IDE request parser |
-| Webhook auth (`verify_webhook`: HMAC / shared secret) | **Yes** | Replaced by per-developer auth (ADR-001) |
-| `TicketPayload` contract | Partly (field names) | Generalise to a `TaskPayload` (§5) |
-| Idempotency / lease (`_claim_job`, DynamoDB) | No | Reuse; key becomes a generic `task_id` (ADR-004) |
-| SQS `JobsQueue` + DLQ + consumer Lambda | No | **Reuse unchanged** |
-| AgentCore Runtime pipeline (`agent.py`) | Partly (assumes a scoped fix) | Reused unchanged for `one_shot`; a second variant (`spec_agent.py`) reuses its building blocks for `spec` (ADR-002 Option C) |
-| Status write-back to DynamoDB | No | Reuse; add a read API in front (§6) |
-| Security controls (allowlist, redaction, argv, shell=False) | No | **Reuse unchanged** |
+| Layer | IDE-specific? | Behaviour |
+|-------|---------------|-----------|
+| Request parser | **Yes** | An IDE request parser (the Jira path uses `parser.py`: label gate, Part-1 header, `sonar-hash`) |
+| Authentication | **Yes** | Per-developer OIDC/JWT auth (ADR-001); the Jira path uses `verify_webhook` HMAC / shared secret |
+| `TaskPayload` contract | Shared | One contract for both ingresses (§5) |
+| Idempotency / lease (`_claim_job`, DynamoDB) | Shared | Key is the generic `task_id` (ADR-004) |
+| SQS `JobsQueue` + DLQ + consumer Lambda | Shared | The same queue, DLQ, and consumer |
+| AgentCore Runtime pipeline | Shared | `agent.py` for `one_shot`, `spec_agent.py` for `spec` (ADR-002 Option C) |
+| Status write-back to DynamoDB | Shared | The same status row, with a read API in front (§6) |
+| Security controls (allowlist, redaction, argv, shell=False) | Shared | Identical on both ingresses |
 
-The expensive, security-sensitive, well-tested core is reusable. The new surface
-is: **(a) an authenticated ingress, (b) a payload mapping, (c) a results API.**
+The expensive, security-sensitive, well-tested core is shared. The IDE-specific
+surface is: **(a) an authenticated ingress, (b) a payload mapping, (c) a results
+API.**
 
 ---
 
-## 3. Proposed architecture
+## 3. Architecture
 
 ```
   Kiro IDE (VSCode ext)                         AWS
@@ -79,82 +76,76 @@ is: **(a) an authenticated ingress, (b) a payload mapping, (c) a results API.**
   └───────────────────┘                                        │
            ▲                                                    ▼
            │                                            ┌────────────────┐
-           │                                            │ Ingress Lambda │  (NEW)
+           │                                            │ Ingress Lambda │
            │                                            │ authn/authz    │
            │                                            │ validate+map   │  IDE req → TaskPayload
-           │                                            │ claim task_id  │  (DynamoDB lease — reused)
+           │                                            │ claim task_id  │  (DynamoDB lease)
            │                                            │ enqueue → 202  │
            │                                            └───────┬────────┘
            │                                                    │ sqs:SendMessage (TaskPayload JSON)
            │                                                    ▼
            │                                            ┌────────────────┐
-           │                                            │   JobsQueue    │  SQS (+ DLQ)  — REUSED
+           │                                            │   JobsQueue    │  SQS (+ DLQ)
            │                                            └───────┬────────┘
            │                                                    ▼
            │                                            ┌────────────────┐
-           │                                            │   Consumer     │  — REUSED
+           │                                            │   Consumer     │
            │                                            │ invoke runtime │
            │                                            └───────┬────────┘
            │                                                    ▼
            │                                   ┌───────────────────────────────┐
-           │                                   │ AgentCore Runtime (N parallel) │  — REUSED pipeline
+           │                                   │ AgentCore Runtime (N parallel) │
            │                                   │  clone → kiro → test → PR      │
            │                                   └───────────────┬───────────────┘
            │                                                   │ write status
-           │  GET /tasks/{id}  (poll)  or  WebSocket (stream)  ▼
+           │  GET /tasks/{id}  (poll)                          ▼
            └───────────────────────────────────────────  DynamoDB (job/task status)
                               ▲                                 │
-                       Status API Lambda (NEW)  ◄───────────────┘
+                         Status API Lambda  ◄──────────────────┘
 ```
 
-**One added ingress Lambda, one added status API, everything between SQS and
-DynamoDB reused.** The IDE never talks to AgentCore directly — it only sees the
-two HTTP endpoints, which keeps AWS creds and the runtime ARN server-side.
+The IDE talks only to the two HTTP endpoints (`POST /tasks` to dispatch, the
+status API to poll); it never talks to AgentCore directly, which keeps AWS creds
+and the runtime ARN server-side.
 
 ---
 
-## 4. The crux: what *is* an IDE task? (drives most of the design)
+## 4. The two task shapes (drives most of the design)
 
-The Jira ingress handles a **narrow, structured task**: "fix this specific
-SonarQube finding in this file." The one-shot deterministic pipeline is built
-around that shape: one `kiro-cli` brief, auto-detected tests, up to 3 retries,
-one PR.
+A task comes in one of two shapes, selected by a `task_type` discriminator on
+the payload (§5, ADR-002 Option C). Both shapes are supported through this
+ingress:
 
-An IDE task is bigger. ADR-002 is **ACCEPTED as Option C**: the headline IDE
-shape is a **whole `tasks.md`** produced by a local spec-driven workflow (the
-Kiro flow: `requirements.md`, then `design.md`, then `tasks.md`, often tens of
-tasks). The developer offloads the ENTIRE task list to a remote worker that
-reads it and iterates task-by-task. Both shapes are supported, selected by a
-`task_type` discriminator on the payload (§5):
+- **`task_type="one_shot"`.** A bounded, scoped task: repo + base branch + an
+  optional target (file/area) + a natural-language `instruction` + acceptance =
+  tests pass. It maps 1:1 onto the `one_shot` pipeline (`description` → kiro-cli
+  brief) in `runtime/agent.py`. This is also the shape the Jira ingress uses.
+- **`task_type="spec"`.** A whole `tasks.md` (inline or referenced in the repo)
+  produced by a local spec-driven workflow (the Kiro flow: `requirements.md`,
+  then `design.md`, then `tasks.md`, often tens of tasks). The developer offloads
+  the ENTIRE task list to the **spec-executor** worker
+  (`runtime/spec_agent.py`), which reads it and iterates task-by-task. Its outer
+  loop is deterministic plain code (model reasoning stays inside each per-task
+  pass, faithful to B1); it runs a fresh per-task brief, commits once per
+  completed task on a single branch, and opens one PR per spec with
+  stop-at-first-blocker semantics.
 
-- **`task_type="one_shot"` (the original scoped path, retained).** A bounded
-  task: repo + base branch + an optional target (file/area) + a natural-language
-  `instruction` + acceptance = tests pass. It maps 1:1 onto the existing
-  pipeline (`description` → kiro-cli brief) and `runtime/agent.py` is reused
-  unchanged.
-- **`task_type="spec"` (the headline IDE shape).** A whole `tasks.md` (inline or
-  referenced in the repo) run by a NEW, SEPARATE **spec-executor** worker
-  variant (`runtime/spec_agent.py`). Its outer loop is deterministic plain code
-  (model reasoning stays inside each per-task pass, faithful to B1); it runs a
-  fresh per-task brief, commits once per completed task on a single branch, and
-  opens one PR per spec with stop-at-first-blocker semantics.
-
-ADR-002 is the authority for this decision. The spec-executor's full design
-(tasks.md source, the outer loop, budgets, the `task N/total` progress phase,
-security reuse, and the deferred parallelism follow-up) lives in
-[spec-executor.md](spec-executor.md). The original one-shot minion
-(`runtime/agent.py`, the Jira/SonarQube path) is left behaviourally unchanged.
+ADR-002 records this decision. The spec-executor's full design (tasks.md source,
+the outer loop, budgets, the `task N/total` progress phase, security reuse, and
+the deferred parallelism follow-up) lives in
+[spec-executor.md](spec-executor.md).
 
 ---
 
-## 5. Payload contract (generalising `TicketPayload` → `TaskPayload`)
+## 5. Payload contract (`TaskPayload`)
 
-The runtime consumes a `TaskPayload` (a superset of the original
-`TicketPayload`, see [payload.md](payload.md) and ADR-005). The IDE ingress
-produces the **same downstream contract** so SQS / consumer / runtime do not
-change. A `task_type` discriminator selects which pipeline runs:
+The runtime consumes a `TaskPayload`, the single shared contract (the historical
+`TicketPayload` generalised; see [payload.md](payload.md) and ADR-005). The IDE
+ingress produces the same contract both ingresses use, so the SQS queue, the
+consumer, and the runtime are identical for either source. A `task_type`
+discriminator selects which pipeline runs:
 
-- `task_type="one_shot"` (default when absent): the original scoped-fix path.
+- `task_type="one_shot"` (default when absent): the scoped-fix path.
   `description`, `summary`, and `repo_clone_url` are **required**.
 - `task_type="spec"`: the whole-`tasks.md` spec-executor path. It requires
   `repo_clone_url`, `summary` (used for the PR title), and EITHER
@@ -221,50 +212,46 @@ change. A `task_type` discriminator selects which pipeline runs:
   `#` (so it cannot land in the `quota#…` namespace), whitespace, and overlong
   values, so a client can neither collide with a Jira hash / quota counter nor
   target another tenant's row via the status API's by-key read.
-- The one_shot runtime path needs **no change**: `description` stays the
-  kiro-cli brief and `acceptance=tests_pass`. The spec path adds the
-  spec-executor worker (see [spec-executor.md](spec-executor.md)).
+- The one_shot runtime path uses `description` as the kiro-cli brief with
+  `acceptance=tests_pass`. The spec path runs the spec-executor worker (see
+  [spec-executor.md](spec-executor.md)).
 
 ---
 
 ## 6. Results / feedback channel
 
-Jira ingress is fire-and-forget (the PR shows up later). A developer in an IDE
-expects feedback. Options (ADR-003):
+The Jira ingress is fire-and-forget (the PR shows up later); a developer in an
+IDE expects feedback. The results channel is **polling** (ADR-003):
+`GET /tasks/{task_id}` returns the current status row from DynamoDB (`queued` /
+`in_flight` / `done`+`pr_url` / `failed` / `tests_failed` + a redacted reason).
+The extension polls every few seconds. It is stateless and cheap and reuses the
+status row the runtime already writes.
 
-- **Option A — Polling (recommended v1).** `GET /tasks/{task_id}` returns the
-  current status row from DynamoDB (`queued` / `in_flight` / `done`+`pr_url` /
-  `failed` / `tests_failed` + a redacted reason). The extension polls every few
-  seconds. Simplest, stateless, cheap, reuses the status row we already write.
-  The endpoint is read-only and scopes IDE-sourced rows to their owner: a
-  verified identity may only read its OWN IDE tasks (the row records the
-  dispatching `actor`); another identity gets `404` (existence is not leaked).
-  Jira-sourced rows have no per-developer owner and stay readable by any
-  verified identity.
-- **Option B — Streaming (WebSocket / SSE via API Gateway).** Near-real-time
-  milestones ("cloning", "running tests", "PR opened"). Better UX, more moving
-  parts (connection state, fan-out, auth on the socket).
+The endpoint is read-only and scopes IDE-sourced rows to their owner: a verified
+identity may only read its OWN IDE tasks (the row records the dispatching
+`actor`); another identity gets `404` (existence is not leaked). Jira-sourced
+rows have no per-developer owner and stay readable by any verified identity.
 
-**Recommendation:** polling for v1 (the status row already exists), add a status
-`detail`/`phase` field so the IDE can show coarse progress; revisit streaming
-once the hand-off is proven. The runtime may need to emit a couple of
-intermediate status updates (e.g. `phase=cloning|fixing|testing|opening_pr`) for
-a decent polling UX — small, additive change.
+The status row carries a coarse `phase` field so the IDE can show progress; the
+runtime emits intermediate updates (`phase=cloning|fixing|testing|opening_pr`).
+Streaming over a WebSocket (near-real-time milestones at the cost of connection
+state, fan-out, and socket auth) was considered in ADR-003 and left for a future
+revisit.
 
 ---
 
 ## 7. How the result gets back to the dev
 
 The laptop has local, possibly-uncommitted state; the worker clones from the
-remote. The contract must be explicit (ADR-006):
+remote. The result is delivered as a **GitHub PR** (ADR-006): the worker pushes
+a branch and opens a PR, and the IDE surfaces the PR link. This fits the
+customer's enforced dev workflow and needs no new delivery mechanism. ADR-006
+also weighed two alternatives and set them aside:
 
-- **Option A — PR (like today, recommended).** Worker pushes a branch and opens
-  a PR; the IDE surfaces the PR link. Fits the customer's "enforced dev
-  workflow" and needs zero new mechanism.
-- **Option B — Branch only.** Worker pushes a branch; the dev pulls it locally.
+- **Branch only.** The worker pushes a branch and the dev pulls it locally.
   Lighter-weight, but skips review gates the customer may rely on.
-- **Option C — Patch artifact.** Worker produces a diff the IDE applies locally.
-  Most "local-feeling", but loses the clean-clone isolation and needs a new
+- **Patch artifact.** The worker produces a diff the IDE applies locally. Most
+  "local-feeling", but loses the clean-clone isolation and needs a new
   artifact channel.
 
 A prerequisite either way: the worker operates on **pushed/committed** state, so
@@ -273,61 +260,61 @@ before dispatch. This is a workflow contract to confirm with the customer.
 
 ---
 
-## 8. Security & multi-tenant concerns (new vs the webhook)
+## 8. Security and multi-tenant concerns
+
+Because the IDE ingress is called by individual developers rather than one
+trusted sender, it carries identity and multi-tenant controls in addition to the
+shared security controls:
 
 - **Per-developer identity (ADR-001).** A shared webhook secret is not enough:
-  we need to know *who* dispatched, scope repo access to their permissions, and
-  audit it. Options: OIDC via their IdP/SSO, Cognito, or short-lived tokens the
-  extension already holds. This also feeds `actor` in the payload for audit.
-- **Repo authorization.** Today's static `REPO_ALLOWLIST` (defence in depth)
-  stays, but per-dev dispatch means we should also check the *actor* is allowed
-  to target that repo — not just that the repo is globally allowlisted.
+  the system needs to know *who* dispatched, scope repo access to their
+  permissions, and audit it. Identity is established with OIDC via the customer's
+  IdP, and feeds `actor` in the payload for audit.
+- **Repo authorization.** The static `REPO_ALLOWLIST` (defence in depth) applies
+  to both ingresses; per-developer dispatch adds actor-level scoping of which
+  repos an identity may target, beyond the global allowlist.
 - **GitHub credentials.** The worker uses a server-side `GITHUB_TOKEN` via the gh
-  credential helper. For per-dev attribution we may want the PR authored as a
-  bot with the dev noted, or (bigger) per-dev tokens. Scope decision for later.
-- **Concurrency & cost guardrails become required, not optional.** The whole
-  point is more parallelism: Lambda reserved concurrency, AgentCore session
-  limits, Bedrock token spend, and a per-actor dispatch rate/quota all move from
-  "nice to have" (backlog I3/I5) to **required** for this feature. See ADR-007.
-- **Secret redaction, no-token-in-argv, shell=False** carry over unchanged.
+  credential helper. Per-developer PR attribution (a bot author noting the dev,
+  or per-dev tokens) is a possible future refinement.
+- **Concurrency and cost guardrails.** Because parallelism scales in the cloud,
+  the ADR-007 guardrails apply: Lambda reserved concurrency, the consumer cap as
+  the worker ceiling, an alert-only budget, and a per-actor dispatch quota. See
+  ADR-007 and the quota/audit-log section below.
+- **Secret redaction, no-token-in-argv, shell=False** apply identically on both
+  ingresses.
 
 ---
 
-## 9. Phasing (proposed)
+## 9. What is implemented
 
-1. **Spike / design (this doc + ADRs).** ADR-001..007 are ACCEPTED (ADR-002 as
-   Option C). Done.
-2. **Thin PoC:** new ingress Lambda + `/tasks` route that authenticates, maps an
-   IDE request → `TaskPayload`, claims, and enqueues onto the **existing** SQS.
-   Reuse everything downstream. Add `GET /tasks/{id}` reading the status row.
-   Done.
-3. **IDE integration:** customer extension calls `/tasks` + polls `/tasks/{id}`.
-4. **Hardening:** per-actor quotas, concurrency caps, cost alarms, audit log,
-   intermediate status phases for progress UX. Done.
-5. **Spec-executor worker (ADR-002 Option C, done):** the `task_type="spec"`
-   variant that runs a whole `tasks.md` (deterministic outer loop, one commit
-   per task, one PR per spec, stop-at-first-blocker). See
-   [spec-executor.md](spec-executor.md).
-6. **(Follow-up) Intra-spec parallelism** for independent tasks: deferred, needs
-   a `tasks.md` dependency convention (see [spec-executor.md](spec-executor.md)
-   §10).
+This ingress is live: the `/tasks` ingress Lambda authenticates (OIDC/JWT), maps
+an IDE request to the shared `TaskPayload`, claims the `task_id`, and enqueues on
+the shared SQS `JobsQueue`; `GET /tasks/{task_id}` reads the owner-scoped status
+row; per-actor quotas, concurrency caps, the alert-only budget, the audit log,
+and intermediate status phases are all in place; and the `task_type="spec"`
+spec-executor worker runs a whole `tasks.md` (deterministic outer loop, one
+commit per task, one PR per spec, stop-at-first-blocker; see
+[spec-executor.md](spec-executor.md)).
 
-Each phase ships with unit tests using the existing fakes; no real AWS/GitHub in
-tests; keep the diff focused per phase.
+Intra-spec parallelism for independent tasks is a deferred follow-up: it needs a
+`tasks.md` dependency convention (see [spec-executor.md](spec-executor.md) §10).
+
+The whole capability is covered by unit tests that use the in-memory fakes; no
+test touches real AWS or GitHub.
 
 ---
 
 ## 10. Decisions (ADRs)
 
-All of the decisions below are **ACCEPTED** and implemented; the full records
-are in [adr/README.md](adr/README.md):
+This capability is built on ADR-001..007, all **ACCEPTED** and implemented; the
+full records are in [adr/README.md](adr/README.md):
 
 - **ADR-001**: developer authentication: OIDC via the customer's existing IdP.
-- **ADR-002**: task shape: **Option C**, a new "spec-executor" worker variant
-  that runs a whole `tasks.md` (plus the retained `one_shot` scoped path),
-  selected by `task_type`. See [spec-executor.md](spec-executor.md).
-- **ADR-003**: results channel: polling for v1 (with a `phase` field, including
-  the spec-executor's `task N/total`).
+- **ADR-002**: task shape: **Option C**, a spec-executor worker variant that
+  runs a whole `tasks.md` alongside the `one_shot` scoped path, selected by
+  `task_type`. See [spec-executor.md](spec-executor.md).
+- **ADR-003**: results channel: polling (with a `phase` field, including the
+  spec-executor's `task N/total`).
 - **ADR-004**: idempotency key & DynamoDB schema: a generic `task_id` carried
   in the physical `sonar_hash` key; additive schema.
 - **ADR-005**: payload naming: generalise to `TaskPayload`, keep field names,

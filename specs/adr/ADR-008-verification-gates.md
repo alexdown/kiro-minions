@@ -198,7 +198,7 @@ Both gates run post-loop on the cumulative diff. Do they run as:
 
 ## Status / next step
 
-ACCEPTED (see "Accepted decisions"). Implementation proceeds: a shared gate
+ACCEPTED (see "Accepted decisions") and implemented: a shared gate
 module (in-container `kiro-cli` review + verify-vs-spec, severity-gated,
 redaction, draft/non-draft routing) invoked by the spec-executor's post-loop
 phase (`runtime/spec_agent.py`) AND by the one-shot minion before its PR

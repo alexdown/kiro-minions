@@ -1,6 +1,6 @@
 # ADR-003: Results / feedback channel to the IDE
 
-**Status:** PROPOSED (needs your decision)
+**Status:** ACCEPTED (Option A — polling)
 **Context doc:** [../ide-ingress.md](../ide-ingress.md) §6
 
 ## Context
@@ -40,12 +40,13 @@ The worker POSTs the result to a customer-provided URL.
 
 ## Decision
 
-_To be recorded by the maintainer._ Recommendation: **Option A (polling) for
-v1**, adding a coarse `phase` field to the status row (`queued` / `cloning` /
-`fixing` / `testing` / `opening_pr` / terminal) so the IDE can show progress.
-Revisit **Option B (streaming)** once the hand-off is proven and if UX demands it.
+**Option A (polling)** is accepted and implemented: `GET /tasks/{task_id}` reads
+the status row, and a coarse `phase` field (`queued` / `cloning` / `fixing` /
+`testing` / `opening_pr` / terminal, plus the spec-executor's `task N/total`)
+lets the IDE show progress. Option B (streaming) can be revisited once the
+hand-off is proven and if UX demands it.
 
-**Questions that decide this:**
+**Questions that informed this:**
 1. Is "poll until done, then show the PR link" acceptable UX for v1, or is
    live progress a hard requirement?
 2. If live progress matters, is a coarse `phase` (polled) enough, or do they

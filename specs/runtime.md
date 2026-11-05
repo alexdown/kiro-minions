@@ -1,34 +1,28 @@
 # Runtime
 
-The coding agent is a **deterministic Python script** running inside an **AgentCore Runtime custom container**. It replaces the previous managed-harness approach (two nested model loops) with a single-loop architecture where only `kiro-cli` performs AI reasoning.
+The coding agent is a **deterministic Python script** running inside an **AgentCore Runtime custom container**. It uses a single-loop architecture where only `kiro-cli` performs AI reasoning; every other step is plain sequential code.
 
-## Why Runtime over Managed Harness?
+## Why a deterministic pipeline
 
-> **Historical note.** The paragraphs below describe the **retired** managed-harness
-> design purely as rationale for the current B1 architecture. The legacy harness
-> definition is preserved, clearly marked `[LEGACY]`, under `agent/` and in
-> [harness.md](harness.md). The deployed system no longer uses it.
-
-The previous architecture used an AgentCore managed harness (a Strands-powered model-in-a-loop) that drove `kiro-cli` via its built-in `shell` tool. This created **two nested agent loops**:
-
-1. Outer loop: Claude reasoning about which shell commands to run (clone, branch, test, push…)
-2. Inner loop: kiro-cli reasoning about the actual code fix
-
-The outer loop added cost, latency, and a failure mode (model deviation) without adding value — because the workflow is deterministic. The B1 architecture collapses this to:
+The workflow a coding agent performs (clone, branch, test, commit, push, open PR) is mechanical and does not need a model to decide how to run it. The B1 architecture reflects that by splitting the work into exactly two concerns:
 
 1. **Deterministic script** handles the mechanical workflow (clone, branch, test, commit, push, PR)
 2. **kiro-cli** handles the only creative step (the code fix)
 
+Keeping a model out of the mechanical steps removes a whole class of failure (model deviation from the intended workflow) and keeps cost and latency proportional to the single kiro-cli call per fix.
+
 ### Tradeoffs accepted
 
-| Gained | Gave up |
-|--------|---------|
-| ~50% lower token cost (no outer model) | Model-driven error recovery on novel failures |
-| Predictable, testable workflow | Adaptability to unexpected edge cases |
-| Lower latency per task | "Self-healing" behavior on weird build systems |
-| No prompt drift on workflow steps | Zero-code maintenance (now ~150 lines of Python) |
+A deterministic pipeline trades model-driven flexibility for predictability. The table below lists what the design gains and the inherent tradeoffs it accepts:
 
-For a small-scale test this is the right tradeoff. If novel failure patterns emerge at scale, we can add targeted model reasoning for those cases (evolving toward B2).
+| Gained | Tradeoff |
+|--------|----------|
+| ~50% lower token cost (one model call per fix) | No model-driven error recovery on novel failures |
+| Predictable, testable workflow | Less adaptability to unexpected edge cases |
+| Lower latency per task | No "self-healing" behavior on weird build systems |
+| No prompt drift on workflow steps | The workflow is explicit Python (~150 lines) to maintain |
+
+For a small-scale test this is the right tradeoff. If novel failure patterns emerge at scale, targeted model reasoning can be added for those cases (evolving toward B2).
 
 ## Container contents
 
@@ -47,18 +41,18 @@ The Docker image (`runtime/Dockerfile`) is ARM64 and pre-installs:
 
 ## Pipeline: `agent.py`
 
-> **See also: the spec-executor.** This doc describes the ONE-SHOT pipeline
-> (`agent.py`, `task_type="one_shot"`): one brief, one fix, one PR. A second
-> worker variant, the **spec-executor** (`runtime/spec_agent.py`,
-> `task_type="spec"`), reuses the building blocks below to run a whole
-> `tasks.md` task-by-task (one commit per task, one PR per spec,
-> stop-at-first-blocker). Its design lives in
-> [spec-executor.md](spec-executor.md); the one-shot path is left unchanged.
+> **Two pipelines, one container.** The Runtime ships two pipelines, selected by
+> the payload's `task_type`. This doc describes the **one_shot** pipeline
+> (`agent.py`, `task_type="one_shot"`): one brief, one fix, one PR. The
+> **spec-executor** pipeline (`runtime/spec_agent.py`, `task_type="spec"`) shares
+> these building blocks to run a whole `tasks.md` task-by-task (one commit per
+> task, one PR per spec, stop-at-first-blocker); its design lives in
+> [spec-executor.md](spec-executor.md).
 
 The entrypoint is a deterministic sequential script:
 
 ```
-receive TicketPayload (JSON)
+receive TaskPayload (JSON)
   → configure git auth (gh auth setup-git; token read from env, never in URL/argv)
   → re-check repo allowlist (defence in depth)
   → clone repo
@@ -108,7 +102,7 @@ The status write is best-effort (a DynamoDB error is logged with `redact()` and 
 
 ## Invocation contract
 
-The **consumer** Lambda (not the webhook producer) sends the **TicketPayload as JSON** directly (not a rendered prompt) after receiving it from the SQS `JobsQueue`:
+The **consumer** Lambda (not the webhook producer) sends the **TaskPayload as JSON** directly (not a rendered prompt) after receiving it from the SQS `JobsQueue`:
 
 ```python
 client = boto3.client("bedrock-agentcore", region_name="us-east-1")
@@ -122,7 +116,7 @@ response = client.invoke(
 
 The Runtime's `agent.py` receives this payload in its `@app.entrypoint` handler and runs the pipeline.
 
-### Payload schema (unchanged since the legacy managed-harness design; see [harness.md](harness.md))
+### Payload schema
 
 ```json
 {
