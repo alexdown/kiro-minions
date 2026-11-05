@@ -1,6 +1,6 @@
 # ADR-004: Idempotency key & DynamoDB schema
 
-**Status:** PROPOSED (needs your decision)
+**Status:** ACCEPTED (Option A — generic `task_id`, additive schema)
 **Context doc:** [../ide-ingress.md](../ide-ingress.md) §5
 
 ## Context
@@ -49,13 +49,12 @@ Trust the IDE to send a unique idempotency key per task; no server-side derivati
 
 ## Decision
 
-_To be recorded by the maintainer._ Recommendation: **Option A** — generalise to
-a logical `task_id` on the **same** table, keep the physical partition-key
-attribute name to avoid a migration, map Jira `sonar_hash → task_id` 1:1, and let
-the IDE ingress derive a stable `task_id` (with a client-supplied idempotency key
-as an optional override).
+**Option A** is accepted and implemented: a logical `task_id` on the **same**
+table, keeping the physical `sonar_hash` partition-key attribute name, with Jira
+`sonar_hash → task_id` mapped 1:1 and the IDE ingress deriving a stable `task_id`
+(with a client-supplied idempotency key as an optional, constrained override).
 
-**Questions that decide this:**
+**Questions that informed this:**
 1. Keep one table (simpler downstream) or isolate IDE tasks in their own table?
 2. Should the idempotency key be server-derived (collision-safe) or client-
    supplied (simpler)? Recommendation: server-derived with optional client key.

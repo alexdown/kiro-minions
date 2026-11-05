@@ -1,6 +1,6 @@
 # ADR-001: Developer authentication to the IDE ingress
 
-**Status:** PROPOSED (needs your decision)
+**Status:** ACCEPTED (Option A — OIDC via the customer's IdP)
 **Context doc:** [../ide-ingress.md](../ide-ingress.md) §8
 
 ## Context
@@ -58,11 +58,12 @@ Issue each developer a long-lived key.
 
 ## Decision
 
-_To be recorded by the maintainer._ Recommendation: **Option A (OIDC via the
-customer's IdP)** if they have OIDC SSO; fall back to **Option B (Cognito)** only
-if they don't. Avoid D.
+**Option A (OIDC via the customer's IdP)** is accepted and implemented: the
+`/tasks` routes sit behind an API Gateway OIDC/JWT authorizer, and the verified
+claims (`sub`/`email`) populate `actor`. Option B (Cognito) is the fallback if a
+customer lacks OIDC SSO.
 
-**Questions that decide this:**
+**Questions that informed this:**
 1. Does the customer have an OIDC-capable IdP/SSO their extension can get a token from?
 2. Do they want us to own identity (Cognito) or federate to theirs?
 3. Must repo access be scoped to the *individual's* GitHub permissions, or is a

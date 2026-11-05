@@ -2,18 +2,25 @@
 
 ## Project Summary
 
-**kiro-minions** is an autonomous SonarQube remediation pipeline: a labelled Jira ticket goes in, a GitHub PR comes out, with no human in the loop between the two.
+**kiro-minions** is a remote autonomous coding worker: hand it a coding task, it runs on AWS AgentCore, and it delivers a GitHub PR, with no human in the loop between the task and the PR.
 
-The system is an **asynchronous, deterministic (B1) pipeline** — there is no outer model loop; the only AI reasoning happens inside `kiro-cli`. It consists of:
+Tasks arrive through **two ingresses** and run as one of **two worker shapes** on **one shared deterministic (B1) spine**. There is no outer model loop; the only AI reasoning happens inside `kiro-cli` (and the optional verification gates).
 
-- **Orchestrator — webhook producer** (Python Lambda behind API Gateway): authenticates the webhook (HMAC / shared-secret, constant-time compare), validates labels (`sonarqube` / `SONARQUBE-FIX`), parses the ticket description header (clone URL, base branch, fix branch, target file) and the `sonar-hash` label, enforces a repo allowlist, atomically **claims** the `sonar_hash` with a DynamoDB lease (idempotency), builds the `TicketPayload`, **enqueues** it on SQS, and returns `202`.
-- **Orchestrator — SQS consumer** (Python Lambda): triggered by the `JobsQueue` (with a DLQ, `maxReceiveCount=3`), it invokes the AgentCore Runtime with the `TicketPayload` JSON.
-- **Coding Agent — AgentCore Runtime** (deterministic custom container): a sequential B1 pipeline — clone → create fix branch → run `kiro-cli` headless → run tests → retry (bounded, with repeated-failure early-stop) → commit → push → open a GitHub PR — that writes its **own terminal job status** (`done` + `pr_url` / `failed` / `tests_failed`) back to DynamoDB. Auth uses the gh credential helper so the token is never placed in the clone URL or argv.
-- **Infrastructure** (AWS SAM): API Gateway HTTP API (with default-route throttling), two Lambdas (producer + consumer), an SQS `JobsQueue` + dead-letter queue, a DynamoDB table for job state/lease (TTL on `lease_expires_at`), and IAM policies for AgentCore, DynamoDB, and SQS.
+- **Two ingresses (peers):**
+  - **Jira/SonarQube webhook:** a SonarQube finding filed as a labelled Jira ticket (`sonarqube` / `SONARQUBE-FIX` + a `sonar-hash:<key>` label); the ticket description is the task contract; HMAC / shared-secret auth.
+  - **Kiro IDE API:** `POST /tasks` (OIDC/JWT, per-actor identity) to dispatch and `GET /tasks/{task_id}` (owner-scoped) to poll.
+- **Two worker shapes (selected by `task_type`):**
+  - **`one_shot`** (one brief → one fix → one PR; `runtime/agent.py`).
+  - **`spec`** (a whole `tasks.md` run task-by-task, one commit per task, one PR per spec, stop-at-first-blocker; `runtime/spec_agent.py` + `runtime/tasks_md.py`).
+- **One shared spine:** authenticate → validate + repo allowlist → atomically **claim** an idempotency key with a DynamoDB lease → **enqueue** the `TaskPayload` on the SQS `JobsQueue` (with a DLQ, `maxReceiveCount=3`) → return `202` → an SQS-triggered **consumer** Lambda invokes the AgentCore Runtime → the Runtime runs the deterministic pipeline and writes its **own terminal job status** (`done` + `pr_url` / `failed` / `tests_failed`) back to DynamoDB. The logical idempotency key is `task_id`, carried in the physical `sonar_hash` partition-key attribute on the shared table.
+- **Coding Agent — AgentCore Runtime** (deterministic custom container): a sequential B1 pipeline (clone → create fix branch → run `kiro-cli` headless → run tests → retry, bounded with repeated-failure early-stop → commit → push → open a GitHub PR). Auth uses the gh credential helper so the token is never placed in the clone URL or argv.
+- **Guardrails (ADR-007):** a repo allowlist (ingress + runtime re-check), a per-actor dispatch quota (`ACTOR_QUOTA_MAX` / `ACTOR_QUOTA_WINDOW_SECONDS`, fail-open with a greppable `quota_fail_open` signal), reserved-concurrency caps on the ingress and consumer Lambdas (SQS backpressure as the worker ceiling), an alert-only AWS Budget, and a redacted structured audit log per dispatch.
+- **Optional verification gates (ADR-008):** adversarial review (Gate A) and verify-vs-spec (Gate B) in `runtime/review_gates.py`, wired into both pipelines behind the default-off `SPEC_REVIEW_ENABLED` / `SPEC_VERIFY_SPEC_ENABLED` flags; a failing / inconclusive / high-severity verdict downgrades the PR to draft.
+- **Infrastructure** (AWS SAM): API Gateway HTTP API (with default-route throttling and the OIDC/JWT authorizer on `/tasks`), the ingress and consumer Lambdas, an SQS `JobsQueue` + dead-letter queue, a DynamoDB table for job state/lease (TTL on `lease_expires_at`), and IAM policies for AgentCore, DynamoDB, and SQS.
 
 Job statuses: `in_flight` (claimed, with a lease) / `done` (terminal, blocks re-dispatch) / `failed` (reclaimable) / `tests_failed` (reclaimable). A claim succeeds only when the row is absent, `failed`, `tests_failed`, or `in_flight` with an expired lease.
 
-The ticket description is the contract: Part 1 is a machine-readable header block, Part 2 is the full SonarQube issue report (description, impact, rule, recommended fix). The orchestrator needs no Jira API credentials; everything arrives in the webhook body.
+For the Jira ingress, the ticket description is the contract: Part 1 is a machine-readable header block, Part 2 is the full SonarQube issue report (description, impact, rule, recommended fix). The orchestrator needs no Jira API credentials; everything arrives in the webhook body.
 
 ---
 

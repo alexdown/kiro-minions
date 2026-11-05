@@ -41,18 +41,18 @@ The Docker image (`runtime/Dockerfile`) is ARM64 and pre-installs:
 
 ## Pipeline: `agent.py`
 
-> **See also: the spec-executor.** This doc describes the ONE-SHOT pipeline
-> (`agent.py`, `task_type="one_shot"`): one brief, one fix, one PR. A second
-> worker variant, the **spec-executor** (`runtime/spec_agent.py`,
-> `task_type="spec"`), reuses the building blocks below to run a whole
-> `tasks.md` task-by-task (one commit per task, one PR per spec,
-> stop-at-first-blocker). Its design lives in
-> [spec-executor.md](spec-executor.md); the one-shot path is left unchanged.
+> **Two pipelines, one container.** The Runtime ships two pipelines, selected by
+> the payload's `task_type`. This doc describes the **one_shot** pipeline
+> (`agent.py`, `task_type="one_shot"`): one brief, one fix, one PR. The
+> **spec-executor** pipeline (`runtime/spec_agent.py`, `task_type="spec"`) shares
+> these building blocks to run a whole `tasks.md` task-by-task (one commit per
+> task, one PR per spec, stop-at-first-blocker); its design lives in
+> [spec-executor.md](spec-executor.md).
 
 The entrypoint is a deterministic sequential script:
 
 ```
-receive TicketPayload (JSON)
+receive TaskPayload (JSON)
   → configure git auth (gh auth setup-git; token read from env, never in URL/argv)
   → re-check repo allowlist (defence in depth)
   → clone repo
@@ -102,7 +102,7 @@ The status write is best-effort (a DynamoDB error is logged with `redact()` and 
 
 ## Invocation contract
 
-The **consumer** Lambda (not the webhook producer) sends the **TicketPayload as JSON** directly (not a rendered prompt) after receiving it from the SQS `JobsQueue`:
+The **consumer** Lambda (not the webhook producer) sends the **TaskPayload as JSON** directly (not a rendered prompt) after receiving it from the SQS `JobsQueue`:
 
 ```python
 client = boto3.client("bedrock-agentcore", region_name="us-east-1")

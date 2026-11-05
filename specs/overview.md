@@ -1,26 +1,32 @@
 # Overview
 
-Autonomous SonarQube remediation: a labelled Jira ticket goes in, a GitHub PR comes out. No human in the loop between the two.
+kiro-minions is a remote autonomous coding worker: hand it a coding task, it runs on AWS AgentCore, and it delivers a GitHub PR. No human is in the loop between the task and the PR.
 
-## The core idea: the coding agent is a deterministic pipeline, not a model loop
+Tasks arrive through **two ingresses** (a Jira/SonarQube webhook and the Kiro IDE API), run as one of **two task shapes** (`one_shot` or `spec`), and flow through **one shared spine**. Everything is built on the deterministic B1 principle.
 
-The coding agent is a **deterministic Python script** running in an **AgentCore Runtime custom container**. It is not a model-in-a-loop. The only AI reasoning happens inside `kiro-cli` — the workflow steps (clone, branch, test, commit, push, PR) are plain sequential code.
+## The core idea: the worker is a deterministic pipeline, not a model loop
+
+The worker is a **deterministic Python script** running in an **AgentCore Runtime custom container**. It is not a model-in-a-loop. The only AI reasoning happens inside `kiro-cli` (and inside the optional verification gates) — the workflow steps (clone, branch, test, commit, push, PR) are plain sequential code.
 
 This is the **B1 architecture**: one model call (kiro-cli), deterministic everything else. See [runtime.md](runtime.md) for the full design rationale and tradeoffs.
 
 ## Flow
 
-The flow is **asynchronous**: the webhook producer Lambda validates, claims, and enqueues, then returns `202` immediately; an SQS-triggered consumer Lambda invokes the long-running Runtime; the Runtime writes its own terminal job status back to DynamoDB.
+Both ingresses feed the same asynchronous spine. The ingress Lambda authenticates, validates and allowlist-checks, claims an idempotency key, and enqueues, then returns `202` immediately; an SQS-triggered consumer Lambda invokes the long-running Runtime; the Runtime writes its own terminal job status back to DynamoDB.
+
+The Jira ingress flow is:
 
 1. SonarQube automation (or an engineer) creates a Jira ticket for a finding. The ticket carries a `sonarqube` / `SONARQUBE-FIX` label and a `sonar-hash:<key>` label, and its **description contains everything the coding agent needs**.
 2. Jira fires a webhook → API Gateway → **orchestrator** (webhook producer) Lambda. The webhook body contains the full ticket: key, summary, description, labels.
-3. The producer **authenticates the webhook first** (HMAC / shared-secret, see Security controls), then parses the webhook body directly (no Jira API call needed), extracts the structured fields, builds a `TicketPayload`, **claims** the `sonar_hash` with a DynamoDB lease (idempotency), **enqueues** the payload JSON on the SQS `JobsQueue`, and returns `202`.
+3. The producer **authenticates the webhook first** (HMAC / shared-secret, see Security controls), then parses the webhook body directly (no Jira API call needed), extracts the structured fields, builds a `TaskPayload`, **claims** the `sonar_hash` with a DynamoDB lease (idempotency), **enqueues** the payload JSON on the SQS `JobsQueue`, and returns `202`.
 4. The SQS `JobsQueue` (with a dead-letter queue, `maxReceiveCount=3`) triggers the **consumer** Lambda, which invokes the AgentCore Runtime with the payload as JSON.
-5. The **AgentCore Runtime** container receives the TicketPayload and runs the deterministic pipeline: clone the repo, create the fix branch, run `kiro-cli` headless, run tests (retrying up to 3 times), commit, push, and open a GitHub PR. It then writes its own **terminal job status** (`done` + `pr_url` / `failed` / `tests_failed`) back to DynamoDB.
+5. The **AgentCore Runtime** container receives the payload and runs the deterministic pipeline: clone the repo, create the fix branch, run `kiro-cli` headless, run tests (retrying up to 3 times), commit, push, and open a GitHub PR. It then writes its own **terminal job status** (`done` + `pr_url` / `failed` / `tests_failed`) back to DynamoDB.
 
-## The ticket description is the contract
+The Kiro IDE ingress follows the identical spine from the claim onward: the ingress Lambda authenticates the developer (OIDC/JWT), maps the request to the shared `TaskPayload`, claims the `task_id`, and enqueues on the same `JobsQueue`. See [ide-ingress.md](ide-ingress.md).
 
-The Jira description is authored as a self-contained task brief in **two parts**:
+## How the Jira ingress supplies the task brief
+
+For the Jira ingress, the ticket description is the task contract. It is authored as a self-contained task brief in **two parts**:
 
 ```
 ── Part 1: structured header block (machine-readable) ──
@@ -42,7 +48,7 @@ Description / Impact / Recommended Fix:
 References · _sonar-hash: 6f50f92a-... (dedup marker)_
 ```
 
-The orchestrator reads **Part 1** to populate the TicketPayload fields. The **entire description** (Part 1 + Part 2) is passed to the Runtime in the payload's `description` field — kiro-cli receives it as its brief.
+The orchestrator reads **Part 1** to populate the payload fields. The **entire description** (Part 1 + Part 2) is passed to the Runtime in the payload's `description` field — kiro-cli receives it as its brief.
 
 ## Architecture
 
@@ -113,12 +119,12 @@ Two Python Lambdas: the **webhook producer** (`handler.handler`) behind API Gate
 - From the description's **Part 1 header block**, extracts: `Clone`, `Base branch`, `File to fix`, `Suggested fix branch` (see [payload.md](payload.md)).
 - From the **labels**, extracts the `sonar-hash:<key>` value → `sonar_hash`.
 - **Idempotency (lease):** before enqueueing, atomically claims the `sonar_hash` (DynamoDB conditional put) writing `status=in_flight` with `lease_expires_at = now + LEASE_SECONDS`. A claim succeeds only when the row is absent, `failed`, `tests_failed`, or `in_flight` with an **expired lease**; a live `in_flight` or a `done` row blocks (skip).
-- **Enqueues** the TicketPayload JSON on the SQS `JobsQueue` and returns `202`. It does **not** invoke the Runtime itself.
+- **Enqueues** the `TaskPayload` JSON on the SQS `JobsQueue` and returns `202`. It does **not** invoke the Runtime itself.
 
 **Consumer (`handler.sqs_consumer`):**
 
 - Triggered by the `JobsQueue` event source mapping (the DLQ captures messages that fail `maxReceiveCount=3` times).
-- **Invokes the Runtime** via boto3 `bedrock-agentcore` → `invoke`, passing `runtimeArn`, a fresh `runtimeSessionId` (≥ 33 chars), and the TicketPayload as JSON bytes.
+- **Invokes the Runtime** via boto3 `bedrock-agentcore` → `invoke`, passing `runtimeArn`, a fresh `runtimeSessionId` (≥ 33 chars), and the `TaskPayload` as JSON bytes.
 
 ### Job statuses, lease, and reclaim
 
@@ -148,7 +154,7 @@ A custom Docker container (ARM64) deployed as an AgentCore Runtime:
 - `runtime/requirements.txt` — Python dependencies (bedrock-agentcore, boto3).
 - `runtime/.bedrock_agentcore.yaml` — deployment configuration for `agentcore launch`.
 
-The pipeline receives the TicketPayload and runs:
+The pipeline receives the `TaskPayload` and runs:
 1. Configure git auth via the gh credential helper (`gh auth setup-git`), then clone the repo — the `GITHUB_TOKEN` is read from the environment and is **never** placed in the clone URL or argv
 2. Create fix branch
 3. Run kiro-cli headless with the issue description as the brief

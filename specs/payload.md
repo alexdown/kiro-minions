@@ -1,6 +1,10 @@
-# Ticket Payload
+# Task Payload
 
-The contract the orchestrator builds from the Jira webhook body. This payload is sent **as JSON** directly to the AgentCore Runtime container. The Runtime's `agent.py` receives it and runs the deterministic fix pipeline.
+`TaskPayload` is the single contract both ingresses produce and both task shapes consume (the historical `TicketPayload`, generalised; see ADR-005). It is sent **as JSON** directly to the AgentCore Runtime container, which receives it and runs the deterministic pipeline selected by `task_type`.
+
+The logical idempotency key is `task_id`, carried in the physical `sonar_hash` partition-key attribute on the shared table (ADR-004), so the claim/lease logic, the consumer, and the runtime are identical across ingresses. A Jira payload carries `source="jira"`; a Kiro IDE payload carries `source="kiro-ide"` with an `actor`. The `task_type` field selects the pipeline: `one_shot` (one brief, one fix, one PR; `runtime/agent.py`) or `spec` (a whole `tasks.md`; `runtime/spec_agent.py`).
+
+The example below shows the fields the Jira ingress supplies; the IDE ingress produces the same contract with `source`/`actor` and (for a spec job) `tasks_md_path`/`tasks_md` (see [ide-ingress.md](ide-ingress.md) §5).
 
 ```json
 {
@@ -30,9 +34,9 @@ The contract the orchestrator builds from the Jira webhook body. This payload is
 | `file_to_fix` | description Part 1 `File to fix:` line | e.g. `server.js:135`; focuses kiro-cli's edit |
 | `sonar_hash` | label `sonar-hash:<key>` | **Idempotency key** |
 
-## Where each field comes from
+## Where each field comes from (Jira ingress)
 
-Two sources in the webhook body: the **structured header** inside `description`, and the **labels** array.
+For the Jira ingress, the fields are sourced from two places in the webhook body: the **structured header** inside `description`, and the **labels** array.
 
 ### 1. Description structured block (Part 1)
 
@@ -83,7 +87,7 @@ The claimed payload is enqueued on the SQS `JobsQueue`; a consumer Lambda then i
 
 ## Invocation
 
-The **consumer** Lambda (triggered by the SQS `JobsQueue`) sends the TicketPayload as JSON bytes to the AgentCore Runtime:
+The **consumer** Lambda (triggered by the SQS `JobsQueue`) sends the `TaskPayload` as JSON bytes to the AgentCore Runtime:
 
 ```python
 import boto3, json, uuid, os
@@ -103,5 +107,5 @@ Key points:
 
 - The consumer calls **`invoke`** on the `bedrock-agentcore` client.
 - `runtimeSessionId` is derived from `sonar_hash` + UUID for traceability, **≥ 33 characters**.
-- The payload is the TicketPayload JSON — no prompt rendering, no natural-language template.
-- The Runtime's `agent.py` receives the payload directly in its `@app.entrypoint` handler.
+- The payload is the `TaskPayload` JSON: no prompt rendering, no natural-language template.
+- The Runtime's entrypoint (`agent.py` for `one_shot`, `spec_agent.py` for `spec`) receives the payload directly in its `@app.entrypoint` handler.
