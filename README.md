@@ -1,5 +1,4 @@
 # kiro-minions
-# kiro-minions
 
 A remote autonomous coding worker: hand it a coding task, it runs on AWS AgentCore, and it delivers a GitHub PR.
 
