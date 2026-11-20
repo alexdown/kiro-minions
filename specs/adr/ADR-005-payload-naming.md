@@ -1,6 +1,6 @@
 # ADR-005: Payload contract naming / generalisation
 
-**Status:** PROPOSED (needs your decision)
+**Status:** ACCEPTED (Option A — one `TaskPayload` superset, additive fields)
 **Context doc:** [../ide-ingress.md](../ide-ingress.md) §5
 
 ## Context
@@ -42,12 +42,12 @@ runtime.
 
 ## Decision
 
-_To be recorded by the maintainer._ Recommendation: **Option A** — one
-`TaskPayload` superset, additive fields (`source`, `actor`), Jira fields optional,
-runtime field names unchanged. Treat the "Ticket→Task" naming as a
-docs/tests-level rename, not a wire-breaking change.
+**Option A** is accepted and implemented: one `TaskPayload` superset with
+additive fields (`source`, `actor`), Jira fields optional, and runtime field
+names unchanged. The `TaskPayload` naming generalises the historical
+`TicketPayload` at the docs/tests level and is not a wire-breaking change.
 
-**Questions that decide this:**
+**Questions that informed this:**
 1. OK to introduce `source` + `actor` and make `sonar_hash`/`ticket_url` optional?
 2. Any objection to the "Ticket → Task" terminology shift in specs/tests?
 

@@ -21,12 +21,13 @@ reusing `runtime/agent.py` building blocks.
 
 ## 1. What this worker is for
 
-The original one-shot minion (`runtime/agent.py`) fixes ONE scoped thing (one
-`kiro-cli` brief, auto-detected tests, up to 3 retries, one PR). That is the
-`task_type="one_shot"` path and it is left untouched.
+The Runtime container runs two pipelines, selected by `task_type`. The
+`task_type="one_shot"` pipeline (`runtime/agent.py`) fixes ONE scoped thing (one
+`kiro-cli` brief, auto-detected tests, up to 3 retries, one PR). This doc
+describes the other pipeline.
 
-The **spec-executor** is a SECOND worker variant (`task_type="spec"`) for a
-different shape of work. A developer follows a local spec-driven workflow (the
+The **spec-executor** is the `task_type="spec"` pipeline, for a different shape
+of work. A developer follows a local spec-driven workflow (the
 Kiro flow: `requirements.md`, then `design.md`, then `tasks.md`) and ends up
 with a whole `tasks.md`: a markdown checklist of tens of tasks that together
 implement one feature or change. Instead of grinding through that task list on
